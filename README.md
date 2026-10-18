@@ -1,6 +1,9 @@
 MechCommander Redux for Mac (unofficial)
 =========================================
 
+**[MacOS Patch download](https://github.com/PepeForFun/MechCommander-MacOS/releases/download/Release/MechCommander-Redux-Mac.zip)**
+
+
 A native Mac version of MechCommander Redux (https://github.com/RevenantBob/MechCommanderRedux),
 the modern rebuild of MechCommander Gold (1999). It runs without Windows, CrossOver or emulation,
 draws through Metal, and sharpens the picture for high-resolution screens.
