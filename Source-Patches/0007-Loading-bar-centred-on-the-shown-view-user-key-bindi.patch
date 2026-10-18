@@ -1,0 +1,507 @@
+From 7257409e2d58d1c07d865eae67bb39ace30fad5a Mon Sep 17 00:00:00 2001
+From: MechCommander Redux Mac port <mac-port@users.noreply.invalid>
+Date: Sun, 18 Oct 2026 11:29:06 +0200
+Subject: [PATCH 7/9] Loading bar centred on the shown view; user key bindings
+ in keys.cfg
+
+- DrawProgress: centre on the display's view. While a mission loads the screen
+  already has the mission's size but the menus' 640x480 view is shown, which put
+  the bar half off the screen.
+- keys.cfg in the user folder ("Action = Key", Ctrl+/Alt+/Shift+, None) overrides
+  the in-mission bindings; written with the defaults when missing; bad lines are
+  logged and skipped.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/lib/MCCore/gui/MCUpdateDisplay.cpp       |  25 +-
+ src/lib/MCCore/iface/MCTacticalInterface.cpp | 422 +++++++++++++++++++
+ 2 files changed, 445 insertions(+), 2 deletions(-)
+
+diff --git a/src/lib/MCCore/gui/MCUpdateDisplay.cpp b/src/lib/MCCore/gui/MCUpdateDisplay.cpp
+index 8159384..b2793fd 100644
+--- a/src/lib/MCCore/gui/MCUpdateDisplay.cpp
++++ b/src/lib/MCCore/gui/MCUpdateDisplay.cpp
+@@ -194,8 +194,29 @@ namespace
+     /// <summary>The connect shape at the screen's centre, with a progress bar of <paramref name="progress"/> percent.</summary>
+     void DrawProgress(int32_t progress)
+     {
+-        const int32_t centerY = GuiSystem().Height() >> 1;
+-        const int32_t centerX = GuiSystem().Width() >> 1;
++        // Port fix: centre on the part of the screen that is shown. While a mission loads, the screen already has
++        // the mission's size (e.g. 1280x720) but the display still shows the menus' 640x480 view of it, which put the
++        // bar half off the screen.
++        int32_t width = GuiSystem().Width();
++        int32_t height = GuiSystem().Height();
++        int32_t viewX = 0;
++        int32_t viewY = 0;
++
++        if (const std::shared_ptr<MCDisplay> display = MCInput::Display(); display != nullptr)
++        {
++            const SDL_Rect view = display->View();
++
++            if (view.w > 0 && view.h > 0)
++            {
++                viewX = view.x;
++                viewY = view.y;
++                width = std::min(width - viewX, view.w);
++                height = std::min(height - viewY, view.h);
++            }
++        }
++
++        const int32_t centerY = viewY + (height >> 1);
++        const int32_t centerX = viewX + (width >> 1);
+         AGShapeDraw(ScreenPort()->Frame(), ConnectShape().Bytes(), 0, centerX, centerY);
+         const int32_t left = centerX - 0x5f;
+         const auto right = static_cast<int32_t>(progress * 0.01 * 188.0 + left);
+diff --git a/src/lib/MCCore/iface/MCTacticalInterface.cpp b/src/lib/MCCore/iface/MCTacticalInterface.cpp
+index 0fb910e..816cecd 100644
+--- a/src/lib/MCCore/iface/MCTacticalInterface.cpp
++++ b/src/lib/MCCore/iface/MCTacticalInterface.cpp
+@@ -1,4 +1,5 @@
+ #include "stdafx.h"
++#include "platform/MCFileSystem.h"
+ #include "iface/MCTacticalInterface.h"
+ #include "camera/MCCamera.h"
+ #include "gui/MCGuiInput.h"
+@@ -126,6 +127,422 @@ namespace
+         {MCKeyCommand::Chat, 0x1c, 0},
+     };
+ 
++
++    // Port: user key bindings. keys.cfg in the user folder ("Action = Key", modifiers "Shift+", "Ctrl+", "Alt+", or
++    // "None") overrides the defaults; it is written with the defaults when missing.
++    struct MCKeyName
++    {
++        std::string_view Name;
++        MCKeyCommand Command;
++    };
++
++    constexpr MCKeyName KeyCommandNames[] = {
++        {"Eject", MCKeyCommand::Eject},
++        {"Stop", MCKeyCommand::Stop},
++        {"Run", MCKeyCommand::Run},
++        {"ForcedOrder", MCKeyCommand::ForcedOrder},
++        {"ForcedRun", MCKeyCommand::ForcedRun},
++        {"ForcedOrderAlternate", MCKeyCommand::ForcedOrderAlternate},
++        {"ForcedJump", MCKeyCommand::ForcedJump},
++        {"RunAlternate", MCKeyCommand::RunAlternate},
++        {"AttackOptimalRange", MCKeyCommand::AttackOptimalRange},
++        {"AttackLongRange", MCKeyCommand::AttackLongRange},
++        {"AttackMediumRange", MCKeyCommand::AttackMediumRange},
++        {"AttackShortRange", MCKeyCommand::AttackShortRange},
++        {"AttackFromPosition", MCKeyCommand::AttackFromPosition},
++        {"AttackConservingAmmo", MCKeyCommand::AttackConservingAmmo},
++        {"Jump", MCKeyCommand::Jump},
++        {"JumpAlternate", MCKeyCommand::JumpAlternate},
++        {"Guard", MCKeyCommand::Guard},
++        {"PowerUp", MCKeyCommand::PowerUp},
++        {"PowerDown", MCKeyCommand::PowerDown},
++        {"AimHead", MCKeyCommand::AimHead},
++        {"AimLeftTorso", MCKeyCommand::AimLeftTorso},
++        {"AimRightTorso", MCKeyCommand::AimRightTorso},
++        {"AimCenterTorso", MCKeyCommand::AimCenterTorso},
++        {"AimLeftArm", MCKeyCommand::AimLeftArm},
++        {"AimRightArm", MCKeyCommand::AimRightArm},
++        {"AimLeftLeg", MCKeyCommand::AimLeftLeg},
++        {"AimRightLeg", MCKeyCommand::AimRightLeg},
++        {"LayMines", MCKeyCommand::LayMines},
++        {"LayMinesAlternate", MCKeyCommand::LayMinesAlternate},
++        {"SelectLance1", MCKeyCommand::SelectLance1},
++        {"SelectLance2", MCKeyCommand::SelectLance2},
++        {"SelectLance3", MCKeyCommand::SelectLance3},
++        {"SelectLance4", MCKeyCommand::SelectLance4},
++        {"AddLance1", MCKeyCommand::AddLance1},
++        {"AddLance2", MCKeyCommand::AddLance2},
++        {"AddLance3", MCKeyCommand::AddLance3},
++        {"AddLance4", MCKeyCommand::AddLance4},
++        {"LinkLance1", MCKeyCommand::LinkLance1},
++        {"LinkLance2", MCKeyCommand::LinkLance2},
++        {"LinkLance3", MCKeyCommand::LinkLance3},
++        {"LinkLance4", MCKeyCommand::LinkLance4},
++        {"BreakLances", MCKeyCommand::BreakLances},
++        {"Artillery1", MCKeyCommand::Artillery1},
++        {"Artillery2", MCKeyCommand::Artillery2},
++        {"Artillery3", MCKeyCommand::Artillery3},
++        {"Artillery4", MCKeyCommand::Artillery4},
++        {"Info", MCKeyCommand::Info},
++        {"HoldTacticalMap", MCKeyCommand::HoldTacticalMap},
++        {"ZoomIn", MCKeyCommand::ZoomIn},
++        {"ZoomOut", MCKeyCommand::ZoomOut},
++        {"ZoomInAlternate", MCKeyCommand::ZoomInAlternate},
++        {"ZoomOutAlternate", MCKeyCommand::ZoomOutAlternate},
++        {"TacticalMapZoomIn", MCKeyCommand::TacticalMapZoomIn},
++        {"TacticalMapZoomOut", MCKeyCommand::TacticalMapZoomOut},
++        {"TacticalMapZoomInAlternate", MCKeyCommand::TacticalMapZoomInAlternate},
++        {"TacticalMapZoomOutAlternate", MCKeyCommand::TacticalMapZoomOutAlternate},
++        {"MapPage", MCKeyCommand::MapPage},
++        {"SalvagePage", MCKeyCommand::SalvagePage},
++        {"InfoPage", MCKeyCommand::InfoPage},
++        {"MissionPage", MCKeyCommand::MissionPage},
++        {"ScrollUp", MCKeyCommand::ScrollUp},
++        {"ScrollDown", MCKeyCommand::ScrollDown},
++        {"ScrollLeft", MCKeyCommand::ScrollLeft},
++        {"ScrollRight", MCKeyCommand::ScrollRight},
++        {"TacticalMapScrollUp", MCKeyCommand::TacticalMapScrollUp},
++        {"TacticalMapScrollDown", MCKeyCommand::TacticalMapScrollDown},
++        {"TacticalMapScrollLeft", MCKeyCommand::TacticalMapScrollLeft},
++        {"TacticalMapScrollRight", MCKeyCommand::TacticalMapScrollRight},
++        {"TogglePalette", MCKeyCommand::TogglePalette},
++        {"CameraFollow", MCKeyCommand::CameraFollow},
++        {"SelectVisible", MCKeyCommand::SelectVisible},
++        {"Chat", MCKeyCommand::Chat}
++    };
++
++    struct MCScanName
++    {
++        std::string_view Name;
++        uint32_t Code;
++    };
++
++    constexpr MCScanName ScanCodeNames[] = {
++        {"Esc", 0x1u},
++        {"1", 0x2u},
++        {"2", 0x3u},
++        {"3", 0x4u},
++        {"4", 0x5u},
++        {"5", 0x6u},
++        {"6", 0x7u},
++        {"7", 0x8u},
++        {"8", 0x9u},
++        {"9", 0xau},
++        {"0", 0xbu},
++        {"Minus", 0xcu},
++        {"Equals", 0xdu},
++        {"Backspace", 0xeu},
++        {"Tab", 0xfu},
++        {"Q", 0x10u},
++        {"W", 0x11u},
++        {"E", 0x12u},
++        {"R", 0x13u},
++        {"T", 0x14u},
++        {"Y", 0x15u},
++        {"U", 0x16u},
++        {"I", 0x17u},
++        {"O", 0x18u},
++        {"P", 0x19u},
++        {"LeftBracket", 0x1au},
++        {"RightBracket", 0x1bu},
++        {"Enter", 0x1cu},
++        {"LeftCtrl", 0x1du},
++        {"A", 0x1eu},
++        {"S", 0x1fu},
++        {"D", 0x20u},
++        {"F", 0x21u},
++        {"G", 0x22u},
++        {"H", 0x23u},
++        {"J", 0x24u},
++        {"K", 0x25u},
++        {"L", 0x26u},
++        {"Semicolon", 0x27u},
++        {"Quote", 0x28u},
++        {"Backquote", 0x29u},
++        {"LeftShift", 0x2au},
++        {"Backslash", 0x2bu},
++        {"Z", 0x2cu},
++        {"X", 0x2du},
++        {"C", 0x2eu},
++        {"V", 0x2fu},
++        {"B", 0x30u},
++        {"N", 0x31u},
++        {"M", 0x32u},
++        {"Comma", 0x33u},
++        {"Period", 0x34u},
++        {"Slash", 0x35u},
++        {"RightShift", 0x36u},
++        {"KeypadMultiply", 0x37u},
++        {"LeftAlt", 0x38u},
++        {"Space", 0x39u},
++        {"CapsLock", 0x3au},
++        {"F1", 0x3bu},
++        {"F2", 0x3cu},
++        {"F3", 0x3du},
++        {"F4", 0x3eu},
++        {"F5", 0x3fu},
++        {"F6", 0x40u},
++        {"F7", 0x41u},
++        {"F8", 0x42u},
++        {"F9", 0x43u},
++        {"F10", 0x44u},
++        {"NumLock", 0x45u},
++        {"ScrollLock", 0x46u},
++        {"Keypad7", 0x47u},
++        {"Keypad8", 0x48u},
++        {"Keypad9", 0x49u},
++        {"KeypadMinus", 0x4au},
++        {"Keypad4", 0x4bu},
++        {"Keypad5", 0x4cu},
++        {"Keypad6", 0x4du},
++        {"KeypadPlus", 0x4eu},
++        {"Keypad1", 0x4fu},
++        {"Keypad2", 0x50u},
++        {"Keypad3", 0x51u},
++        {"Keypad0", 0x52u},
++        {"KeypadPeriod", 0x53u},
++        {"F11", 0x57u},
++        {"F12", 0x58u},
++        {"KeypadEnter", 0x11cu},
++        {"RightCtrl", 0x11du},
++        {"KeypadDivide", 0x135u},
++        {"RightAlt", 0x138u},
++        {"Home", 0x147u},
++        {"Up", 0x148u},
++        {"PageUp", 0x149u},
++        {"Left", 0x14bu},
++        {"Right", 0x14du},
++        {"End", 0x14fu},
++        {"Down", 0x150u},
++        {"PageDown", 0x151u},
++        {"Insert", 0x152u},
++        {"Delete", 0x153u}
++    };
++
++    constexpr uint32_t NoKey = 0xffffffffu;
++
++    std::string Lower(std::string_view text)
++    {
++        std::string lower(text);
++        std::ranges::transform(lower, lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++        return lower;
++    }
++
++    std::string_view Trim(std::string_view text)
++    {
++        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())))
++        {
++            text.remove_prefix(1);
++        }
++
++        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back())))
++        {
++            text.remove_suffix(1);
++        }
++
++        return text;
++    }
++
++    /// <summary>A binding as text ("Ctrl+J", "None").</summary>
++    std::string KeyText(uint32_t key)
++    {
++        if (key == NoKey || (key & 0xffffu) == 0xffffu)
++        {
++            return "None";
++        }
++
++        std::string text;
++
++        if ((key & KeyCtrl) != 0)
++        {
++            text += "Ctrl+";
++        }
++
++        if ((key & KeyAlt) != 0)
++        {
++            text += "Alt+";
++        }
++
++        if ((key & KeyShift) != 0)
++        {
++            text += "Shift+";
++        }
++
++        const uint32_t code = key & 0xffffu;
++
++        for (const MCScanName& scan : ScanCodeNames)
++        {
++            if (scan.Code == code)
++            {
++                return text + std::string(scan.Name);
++            }
++        }
++
++        return text + std::format("0x{:x}", code);
++    }
++
++    /// <summary>A binding from text, or nothing when it can't be read.</summary>
++    std::optional<uint32_t> ParseKey(std::string_view text)
++    {
++        text = Trim(text);
++
++        if (Lower(text) == "none")
++        {
++            return NoKey;
++        }
++
++        uint32_t modifiers = 0;
++
++        while (true)
++        {
++            const size_t plus = text.find('+');
++
++            if (plus == std::string_view::npos || plus + 1 >= text.size())
++            {
++                break;
++            }
++
++            const std::string modifier = Lower(Trim(text.substr(0, plus)));
++
++            if (modifier == "ctrl" || modifier == "control")
++            {
++                modifiers |= KeyCtrl;
++            }
++            else if (modifier == "alt" || modifier == "option")
++            {
++                modifiers |= KeyAlt;
++            }
++            else if (modifier == "shift")
++            {
++                modifiers |= KeyShift;
++            }
++            else
++            {
++                return std::nullopt;
++            }
++
++            text = Trim(text.substr(plus + 1));
++        }
++
++        const std::string name = Lower(text);
++
++        for (const MCScanName& scan : ScanCodeNames)
++        {
++            if (Lower(scan.Name) == name)
++            {
++                return scan.Code | modifiers;
++            }
++        }
++
++        if (name.starts_with("0x"))
++        {
++            uint32_t code = 0;
++            const auto [end, error] = std::from_chars(name.data() + 2, name.data() + name.size(), code, 16);
++
++            if (error == std::errc{} && end == name.data() + name.size() && code < 0x10000)
++            {
++                return code | modifiers;
++            }
++        }
++
++        return std::nullopt;
++    }
++
++    std::filesystem::path KeyConfigPath()
++    {
++        const std::filesystem::path& user = MCFileSystem::UserRoot();
++        return user.empty() ? std::filesystem::path() : user / "keys.cfg";
++    }
++
++    /// <summary>Writes keys.cfg with <paramref name="keys"/> when there is none.</summary>
++    void WriteKeyConfigIfMissing(const std::array<uint32_t, NumKeyCommands>& keys)
++    {
++        const std::filesystem::path path = KeyConfigPath();
++        std::error_code error;
++
++        if (path.empty() || std::filesystem::exists(path, error))
++        {
++            return;
++        }
++
++        std::ofstream out(path);
++
++        if (!out)
++        {
++            return;
++        }
++
++        out << "# MechCommander Redux key bindings (in-mission commands).\n"
++               "# Change the key after '=' and save; the next mission uses it.\n"
++               "# Modifiers: Ctrl+, Alt+ (Option on a Mac keyboard), Shift+   e.g.  Jump = Ctrl+J\n"
++               "# 'None' removes a binding. Delete this file to get the original keys back.\n"
++               "# Key names: A-Z, 0-9, F1-F12, Space, Enter, Tab, Esc, Backspace, Home, End, PageUp, PageDown,\n"
++               "#   Insert, Delete, Up, Down, Left, Right, Minus, Equals, Comma, Period, Slash, Semicolon, Quote,\n"
++               "#   LeftBracket, RightBracket, Backslash, Backquote, Keypad0-Keypad9, KeypadPlus, KeypadMinus,\n"
++               "#   KeypadMultiply, KeypadDivide, KeypadPeriod, KeypadEnter\n\n";
++
++        for (const MCKeyName& entry : KeyCommandNames)
++        {
++            out << std::format("{} = {}\n", entry.Name, KeyText(keys[static_cast<size_t>(entry.Command)]));
++        }
++    }
++
++    /// <summary>Applies keys.cfg to <paramref name="keys"/>; unreadable lines are logged and skipped.</summary>
++    void ApplyKeyConfig(std::array<uint32_t, NumKeyCommands>& keys)
++    {
++        WriteKeyConfigIfMissing(keys);
++        const std::filesystem::path path = KeyConfigPath();
++        std::ifstream in(path);
++
++        if (path.empty() || !in)
++        {
++            return;
++        }
++
++        std::string line;
++        int lineNumber = 0;
++
++        while (std::getline(in, line))
++        {
++            ++lineNumber;
++            const std::string_view text = Trim(line);
++
++            if (text.empty() || text.front() == '#' || text.front() == ';')
++            {
++                continue;
++            }
++
++            const size_t equals = text.find('=');
++
++            if (equals == std::string_view::npos)
++            {
++                SDL_Log("keys.cfg line %d: no '=' (skipped)", lineNumber);
++                continue;
++            }
++
++            const std::string name = Lower(Trim(text.substr(0, equals)));
++            const auto command = std::ranges::find_if(KeyCommandNames, [&](const MCKeyName& entry)
++                                                      { return Lower(entry.Name) == name; });
++
++            if (command == std::end(KeyCommandNames))
++            {
++                SDL_Log("keys.cfg line %d: unknown action '%s' (skipped)", lineNumber, name.c_str());
++                continue;
++            }
++
++            const std::optional<uint32_t> key = ParseKey(text.substr(equals + 1));
++
++            if (!key)
++            {
++                SDL_Log("keys.cfg line %d: unknown key '%s' (skipped)", lineNumber,
++                        std::string(Trim(text.substr(equals + 1))).c_str());
++                continue;
++            }
++
++            keys[static_cast<size_t>(command->Command)] = *key;
++        }
++    }
++
+     /// <summary>
+     /// Sets a binding's key code, keeping its modifier bits, then sets <paramref name="modifiers"/> (the original
+     /// assigns a bitfield's members one by one).
+@@ -260,6 +677,9 @@ auto MCTacticalInterface::Init() -> int32_t
+         BindKey(Keys[static_cast<size_t>(binding.Command)], binding.Code, binding.Modifiers);
+     }
+ 
++    // Port: the user's keys.cfg over the defaults.
++    ApplyKeyConfig(Keys);
++
+     RotateKey = 0x38;
+     SelectedEnemy.reset();
+     CursorOffset = 0;
+@@ -395,6 +815,8 @@ auto MCTacticalInterface::StartScenario() -> void
+     ForcingOrder = false;
+     // The salvage page's key (alt+S by default) becomes alt+C, the chat page, in multiplayer.
+     BindKey(Keys[static_cast<size_t>(MCKeyCommand::SalvagePage)], MultiPlayer() != nullptr ? 0x2e : 0x1f, 0);
++    // Port: the user's keys.cfg wins over that too.
++    ApplyKeyConfig(Keys);
+ }
+ 
+ auto MCTacticalInterface::EndScenario() -> void

@@ -1,0 +1,38 @@
+From 397644d73af2f722d055cf2fe57791f92473bd58 Mon Sep 17 00:00:00 2001
+From: MechCommander Redux Mac port <mac-port@users.noreply.invalid>
+Date: Sun, 18 Oct 2026 10:39:33 +0200
+Subject: [PATCH 4/9] SDL Metal: honour pixels_per_row/rows_per_layer in
+ texture uploads (movies were sheared and tripled)
+
+SDL 3.4.12's METAL_UploadToTexture used the destination width as the source
+row stride; Redux uploads movie frames as a sub-rectangle of a wider buffer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/lib/SDL-release-3.4.12/src/gpu/metal/SDL_gpu_metal.m | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/lib/SDL-release-3.4.12/src/gpu/metal/SDL_gpu_metal.m b/src/lib/SDL-release-3.4.12/src/gpu/metal/SDL_gpu_metal.m
+index a057eab..4b3fb8f 100644
+--- a/src/lib/SDL-release-3.4.12/src/gpu/metal/SDL_gpu_metal.m
++++ b/src/lib/SDL-release-3.4.12/src/gpu/metal/SDL_gpu_metal.m
+@@ -1810,12 +1810,17 @@ static void METAL_UploadToTexture(
+ 
+         MetalTexture *metalTexture = METAL_INTERNAL_PrepareTextureForWrite(renderer, textureContainer, cycle);
+ 
++        // MechCommander Redux Mac port: honour the source's row and image strides (pixels_per_row, rows_per_layer;
++        // 0 means tightly packed), as the other backends do. Without this a sub-rectangle upload from a wider buffer
++        // (the movie frames) lands sheared and repeated.
++        const Uint32 rowPixels = source->pixels_per_row != 0 ? source->pixels_per_row : destination->w;
++        const Uint32 imageRows = source->rows_per_layer != 0 ? source->rows_per_layer : destination->h;
+         [metalCommandBuffer->blitEncoder
+                  copyFromBuffer:bufferContainer->activeBuffer->handle
+                    sourceOffset:source->offset
+-              sourceBytesPerRow:BytesPerRow(destination->w, textureContainer->header.info.format)
++              sourceBytesPerRow:BytesPerRow(rowPixels, textureContainer->header.info.format)
+             // sourceBytesPerImage expects the stride between 2D images (slices) of a 3D texture, not the size of the entire region
+-            sourceBytesPerImage:SDL_CalculateGPUTextureFormatSize(textureContainer->header.info.format, destination->w, destination->h, 1)
++            sourceBytesPerImage:SDL_CalculateGPUTextureFormatSize(textureContainer->header.info.format, rowPixels, imageRows, 1)
+                      sourceSize:MTLSizeMake(destination->w, destination->h, destination->d)
+                       toTexture:metalTexture->handle
+                destinationSlice:destination->layer

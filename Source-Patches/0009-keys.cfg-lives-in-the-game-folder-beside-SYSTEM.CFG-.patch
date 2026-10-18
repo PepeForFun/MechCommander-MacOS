@@ -1,0 +1,52 @@
+From 863f59fd582a9ba5ffdb43204ee4b9ffadf739d8 Mon Sep 17 00:00:00 2001
+From: MechCommander Redux Mac port <mac-port@users.noreply.invalid>
+Date: Sun, 18 Oct 2026 11:34:40 +0200
+Subject: [PATCH 9/9] keys.cfg lives in the game folder (beside SYSTEM.CFG);
+ user folder only when that can't be written
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/lib/MCCore/iface/MCTacticalInterface.cpp | 23 ++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/src/lib/MCCore/iface/MCTacticalInterface.cpp b/src/lib/MCCore/iface/MCTacticalInterface.cpp
+index d3440fb..bf3e4dc 100644
+--- a/src/lib/MCCore/iface/MCTacticalInterface.cpp
++++ b/src/lib/MCCore/iface/MCTacticalInterface.cpp
+@@ -1,4 +1,11 @@
+ #include "stdafx.h"
++#if defined(_WIN32)
++#include <io.h>
++#define MC_WRITABLE(path) (_waccess((path).c_str(), 2) == 0)
++#else
++#include <unistd.h>
++#define MC_WRITABLE(path) (access((path).c_str(), W_OK) == 0)
++#endif
+ #include "platform/MCFileSystem.h"
+ #include "iface/MCTacticalInterface.h"
+ #include "camera/MCCamera.h"
+@@ -448,8 +455,24 @@ namespace
+         return std::nullopt;
+     }
+ 
++    /// <summary>
++    /// keys.cfg's place: the game folder (beside SYSTEM.CFG, easy to find), or the user folder when the game folder
++    /// can't be written to and holds no keys.cfg.
++    /// </summary>
+     std::filesystem::path KeyConfigPath()
+     {
++        std::error_code error;
++
++        if (const std::filesystem::path& game = MCFileSystem::GameRoot(); !game.empty())
++        {
++            const std::filesystem::path inGame = game / "keys.cfg";
++
++            if (std::filesystem::exists(inGame, error) || MC_WRITABLE(game))
++            {
++                return inGame;
++            }
++        }
++
+         const std::filesystem::path& user = MCFileSystem::UserRoot();
+         return user.empty() ? std::filesystem::path() : user / "keys.cfg";
+     }

@@ -1,0 +1,124 @@
+From c6b5e804b72f55089c532dc77e36d33bd76934c2 Mon Sep 17 00:00:00 2001
+From: MechCommander Redux Mac port <mac-port@users.noreply.invalid>
+Date: Sun, 18 Oct 2026 11:09:15 +0200
+Subject: [PATCH 6/9] Mac port: find the real app folder under App
+ Translocation; folder search never throws
+
+A downloaded app that hasn't been moved runs from a hidden read-only copy;
+SecTranslocateCreateOriginalPathForURL gives the folder it was opened from.
+Listing a folder that can't be read crashed (directory_iterator increment threw).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/MCRedux/Main.cpp | 69 ++++++++++++++++++++++++++++++++++++---
+ src/mac/CMakeLists.txt    |  2 +-
+ 2 files changed, 66 insertions(+), 5 deletions(-)
+
+diff --git a/src/apps/MCRedux/Main.cpp b/src/apps/MCRedux/Main.cpp
+index ff9f908..382196d 100644
+--- a/src/apps/MCRedux/Main.cpp
++++ b/src/apps/MCRedux/Main.cpp
+@@ -7,8 +7,64 @@
+ #include "platform/MCAllocator.h"
+ #include "platform/MCFileSystem.h"
+ 
++#if defined(__APPLE__)
++#include <CoreFoundation/CoreFoundation.h>
++#include <dlfcn.h>
++#endif
++
+ namespace
+ {
++#if defined(__APPLE__)
++    /// <summary>
++    /// Mac port: a downloaded (quarantined) app that hasn't been moved is run from a hidden read-only copy (App
++    /// Translocation). The original location comes from the Security framework's SecTranslocateCreateOriginalPathForURL
++    /// (looked up at run time); unchanged when the app isn't translocated or the lookup fails.
++    /// </summary>
++    std::filesystem::path OriginalBundlePath(const std::filesystem::path& bundle)
++    {
++        if (bundle.string().find("/AppTranslocation/") == std::string::npos)
++        {
++            return bundle;
++        }
++
++        using Original = CFURLRef (*)(CFURLRef, CFErrorRef*);
++        void* security = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY);
++        const auto original =
++            security != nullptr ? reinterpret_cast<Original>(dlsym(security, "SecTranslocateCreateOriginalPathForURL"))
++                                : nullptr;
++
++        if (original == nullptr)
++        {
++            return bundle;
++        }
++
++        const std::string text = bundle.string();
++        CFURLRef url = CFURLCreateFromFileSystemRepresentation(
++            nullptr, reinterpret_cast<const UInt8*>(text.c_str()), static_cast<CFIndex>(text.size()), true);
++
++        if (url == nullptr)
++        {
++            return bundle;
++        }
++
++        std::filesystem::path result = bundle;
++
++        if (CFURLRef found = original(url, nullptr); found != nullptr)
++        {
++            char buffer[4096];
++
++            if (CFURLGetFileSystemRepresentation(found, true, reinterpret_cast<UInt8*>(buffer), sizeof(buffer)))
++            {
++                result = buffer;
++            }
++
++            CFRelease(found);
++        }
++
++        CFRelease(url);
++        return result;
++    }
++#endif
+     /// <summary>What the command line asks for: the two folders and the words passed on to the game.</summary>
+     struct MCLaunchOptions
+     {
+@@ -94,18 +150,23 @@ namespace
+ 
+             if (bundle.extension() == ".app")
+             {
+-                const std::filesystem::path beside = bundle.parent_path();
++                const std::filesystem::path beside = OriginalBundlePath(bundle).parent_path();
+                 candidates.push_back(beside);
+                 std::vector<std::filesystem::path> subfolders;
+ 
+-                for (const auto& entry : std::filesystem::directory_iterator(beside, error))
++                // Never throws: an unreadable folder just adds no candidates.
++                for (std::filesystem::directory_iterator it(beside, error), end; !error && it != end; it.increment(error))
+                 {
+-                    if (entry.is_directory(error) && entry.path().extension() != ".app")
++                    std::error_code entryError;
++
++                    if (it->is_directory(entryError) && it->path().extension() != ".app")
+                     {
+-                        subfolders.push_back(entry.path());
++                        subfolders.push_back(it->path());
+                     }
+                 }
+ 
++                error.clear();
++
+                 std::ranges::sort(subfolders);
+                 candidates.insert(candidates.end(), subfolders.begin(), subfolders.end());
+             }
+diff --git a/src/mac/CMakeLists.txt b/src/mac/CMakeLists.txt
+index 156f4c4..8c6b448 100644
+--- a/src/mac/CMakeLists.txt
++++ b/src/mac/CMakeLists.txt
+@@ -40,5 +40,5 @@ target_compile_options(MCCore PRIVATE -Wno-everything $<$<COMPILE_LANGUAGE:CXX>:
+ add_executable(MCRedux ${MCREDUX_SOURCES})
+ target_include_directories(MCRedux PRIVATE ${MC_SRC}/apps/MCRedux)
+ target_precompile_headers(MCRedux PRIVATE ${MC_SRC}/apps/MCRedux/stdafx.h)
+-target_link_libraries(MCRedux PRIVATE MCCore)
++target_link_libraries(MCRedux PRIVATE MCCore "-framework CoreFoundation")
+ target_compile_options(MCRedux PRIVATE -Wno-everything $<$<COMPILE_LANGUAGE:CXX>:-include ${CMAKE_CURRENT_SOURCE_DIR}/prelude.h>)

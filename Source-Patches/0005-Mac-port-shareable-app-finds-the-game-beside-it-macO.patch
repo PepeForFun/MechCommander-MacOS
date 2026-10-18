@@ -1,0 +1,177 @@
+From f4dc80f5dd41ddd251c7054dd6d31598e6993f9a Mon Sep 17 00:00:00 2001
+From: MechCommander Redux Mac port <mac-port@users.noreply.invalid>
+Date: Sun, 18 Oct 2026 10:49:32 +0200
+Subject: [PATCH 5/9] Mac port: shareable app (finds the game beside it, macOS
+ 14+, Retina UI default, make_app.sh)
+
+- Main: on macOS also look in the folder holding the .app and its subfolders;
+  a plain message when the game files aren't found.
+- MCSystemConfig: UIResolution defaults to 720 on macOS (Retina screens).
+- CMake: deployment target macOS 14.0.
+- make_app.sh: builds the .app (neutral bundle id, no paths) into src/mac/dist.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/MCRedux/Main.cpp              | 45 ++++++++++++++++++++++++++
+ src/lib/MCCore/main/MCSystemConfig.cpp |  5 +++
+ src/mac/.gitignore                     |  1 +
+ src/mac/CMakeLists.txt                 |  6 ++--
+ src/mac/make_app.sh                    | 32 ++++++++++++++++++
+ 5 files changed, 86 insertions(+), 3 deletions(-)
+ create mode 100755 src/mac/make_app.sh
+
+diff --git a/src/apps/MCRedux/Main.cpp b/src/apps/MCRedux/Main.cpp
+index dfba5bc..ff9f908 100644
+--- a/src/apps/MCRedux/Main.cpp
++++ b/src/apps/MCRedux/Main.cpp
+@@ -73,6 +73,45 @@ namespace
+             candidates.emplace_back(SDL_GetBasePath());
+         }
+ 
++#if defined(__APPLE__)
++        // Mac port: an app bundle's base path is inside it (X.app/Contents/Resources). Look in the folder that holds
++        // the .app, then in that folder's subfolders (the app beside a "MechCommander Gold" folder).
++        if (SDL_GetBasePath() != nullptr)
++        {
++            std::filesystem::path bundle = std::filesystem::path(SDL_GetBasePath()).lexically_normal();
++
++            while (!bundle.empty() && bundle.has_parent_path() && bundle.extension() != ".app")
++            {
++                const std::filesystem::path parent = bundle.parent_path();
++
++                if (parent == bundle)
++                {
++                    break;
++                }
++
++                bundle = parent;
++            }
++
++            if (bundle.extension() == ".app")
++            {
++                const std::filesystem::path beside = bundle.parent_path();
++                candidates.push_back(beside);
++                std::vector<std::filesystem::path> subfolders;
++
++                for (const auto& entry : std::filesystem::directory_iterator(beside, error))
++                {
++                    if (entry.is_directory(error) && entry.path().extension() != ".app")
++                    {
++                        subfolders.push_back(entry.path());
++                    }
++                }
++
++                std::ranges::sort(subfolders);
++                candidates.insert(candidates.end(), subfolders.begin(), subfolders.end());
++            }
++        }
++#endif
++
+         std::string tried;
+ 
+         for (const std::filesystem::path& folder : candidates)
+@@ -85,9 +124,15 @@ namespace
+             tried += std::format("\n  {}", folder.string());
+         }
+ 
++#if defined(__APPLE__)
++        return std::unexpected(std::format("No MechCommander Gold game files (SYSTEM.CFG) found in:{}\n\nPut this app "
++                                           "next to your MechCommander Gold folder (or inside it) and open it again.",
++                                           tried));
++#else
+         return std::unexpected(std::format("No SYSTEM.CFG found in:{}\nRun MCRedux from the MechCommander Gold "
+                                            "install, put it beside the install, or point -d/--data at it.",
+                                            tried));
++#endif
+     }
+ 
+     /// <summary>The launch options in <paramref name="arguments"/> (the program's name first, as main gets them).</summary>
+diff --git a/src/lib/MCCore/main/MCSystemConfig.cpp b/src/lib/MCCore/main/MCSystemConfig.cpp
+index 2afb29b..b9ceede 100644
+--- a/src/lib/MCCore/main/MCSystemConfig.cpp
++++ b/src/lib/MCCore/main/MCSystemConfig.cpp
+@@ -205,7 +205,12 @@ void ReadPreferences(MCFitIniFile& file)
+     GRendererPreference = GRenderer;
+ 
+     // Port-only: the in-mission UI's lines (0 native, else one of UiResolutions).
++#if defined(__APPLE__)
++    // Mac port: Retina screens make the native-size UI tiny; without a setting the UI is drawn at 720 lines.
++    const int32_t uiResolution = file.Read<int32_t>("UIResolution").value_or(720);
++#else
+     const int32_t uiResolution = file.Read<int32_t>("UIResolution").value_or(0);
++#endif
+     GUiResolution = std::ranges::contains(UiResolutions, uiResolution) ? uiResolution : 0;
+ 
+     // Port: the mode is still read, but the screen is the window's size (MCGuiSystem::OpenDisplay).
+diff --git a/src/mac/.gitignore b/src/mac/.gitignore
+index 4f871c6..7f06388 100644
+--- a/src/mac/.gitignore
++++ b/src/mac/.gitignore
+@@ -2,3 +2,4 @@ build/
+ build-*/
+ *.log
+ run.pid
++dist/
+diff --git a/src/mac/CMakeLists.txt b/src/mac/CMakeLists.txt
+index c516353..156f4c4 100644
+--- a/src/mac/CMakeLists.txt
++++ b/src/mac/CMakeLists.txt
+@@ -1,8 +1,10 @@
+-# macOS build of MechCommander Redux (personal port; the Windows build stays on MSBuild).
++# macOS build of MechCommander Redux (the Windows build stays on MSBuild).
+ # Builds bundled SDL3 + mimalloc, MCCore as a static library and MCRedux as the game executable.
+ # The Vulkan presenter is compiled but has no SPIR-V on macOS, so MCDisplay falls back to the
+ # software renderer + SDL_Renderer (Metal) presenter.
+ cmake_minimum_required(VERSION 3.24)
++# Runs on macOS 14 (Sonoma) and later, Apple Silicon.
++set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "" FORCE)
+ project(MCReduxMac LANGUAGES C CXX OBJC)
+ 
+ set(MC_SRC ${CMAKE_CURRENT_SOURCE_DIR}/..)
+@@ -25,8 +27,6 @@ set(MI_OVERRIDE OFF CACHE BOOL "" FORCE)  # new/delete come from mimalloc-new-de
+ add_subdirectory(${MC_SRC}/lib/mimalloc-3.3.1 mimalloc EXCLUDE_FROM_ALL)
+ 
+ include(${CMAKE_CURRENT_SOURCE_DIR}/sources.cmake)
+-list(LENGTH MCCORE_SOURCES _n)
+-message(STATUS "MCCore sources: ${_n} MC_SRC=${MC_SRC}")
+ 
+ add_library(MCCore STATIC ${MCCORE_SOURCES})
+ target_include_directories(MCCore PUBLIC
+diff --git a/src/mac/make_app.sh b/src/mac/make_app.sh
+new file mode 100755
+index 0000000..871d9b8
+--- /dev/null
++++ b/src/mac/make_app.sh
+@@ -0,0 +1,32 @@
++#!/bin/sh
++# Builds "MechCommander Redux.app" from the CMake build (src/mac/build) into OUT (default: src/mac/dist).
++# The app holds no game data: it looks for MechCommander Gold (a folder with SYSTEM.CFG) next to itself,
++# or in a subfolder beside it. Saves go to ~/Library/Application Support/MechCommander Redux.
++set -e
++HERE="$(cd "$(dirname "$0")" && pwd)"
++OUT="${1:-$HERE/dist}"
++APP="$OUT/MechCommander Redux.app"
++BIN="$HERE/build/MCRedux"
++[ -x "$BIN" ] || { echo "build first: cmake -S $HERE -B $HERE/build && cmake --build $HERE/build -j"; exit 1; }
++rm -rf "$APP"
++mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
++cp "$BIN" "$APP/Contents/MacOS/MCRedux"
++strip -S "$APP/Contents/MacOS/MCRedux"
++cat > "$APP/Contents/Info.plist" <<'EOF'
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0"><dict>
++<key>CFBundleName</key><string>MechCommander Redux</string>
++<key>CFBundleDisplayName</key><string>MechCommander Redux</string>
++<key>CFBundleIdentifier</key><string>io.github.mechcommanderredux.mac</string>
++<key>CFBundleExecutable</key><string>MCRedux</string>
++<key>CFBundlePackageType</key><string>APPL</string>
++<key>CFBundleVersion</key><string>0.2.0</string>
++<key>CFBundleShortVersionString</key><string>0.2.0-mac</string>
++<key>LSMinimumSystemVersion</key><string>14.0</string>
++<key>LSApplicationCategoryType</key><string>public.app-category.strategy-games</string>
++<key>NSHighResolutionCapable</key><true/>
++</dict></plist>
++EOF
++codesign --force --deep -s - "$APP"
++echo "built: $APP"

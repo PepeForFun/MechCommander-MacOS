@@ -1,0 +1,636 @@
+From 307ec7a9cf10b5e3a2028ccf8a1ac910e0192d9f Mon Sep 17 00:00:00 2001
+From: MechCommander Redux Mac port <mac-port@users.noreply.invalid>
+Date: Sun, 18 Oct 2026 10:33:40 +0200
+Subject: [PATCH 2/9] Mac port: GPU renderer on Metal + xBR pixel-art upscale;
+ app bundle launch
+
+- MSL versions of the five shaders (src/mac/generated/shaders/*.msl.h); on
+  Apple MCVulkanShaders loads them (entry main0, SDL_GPU_SHADERFORMAT_MSL) and
+  MCVulkanPresenter creates the SDL GPU device on "metal".
+- Pixel-art upscale (MCPixelArtUpscale, on by default on Apple,
+  MCREDUX_UPSCALE=0 turns it off): the world surface keeps its 1x size and
+  the composite enlarges it with an xBR-lv2 filter instead of nearest.
+- Main: MCREDUX_DATA / MCREDUX_USER environment variables (an app bundle's
+  LSEnvironment) when --data / --user aren't given.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/MCRedux/Main.cpp                     |  13 ++
+ src/lib/MCCore/platform/MCVulkanPresenter.cpp |   7 +-
+ src/lib/MCCore/platform/MCVulkanRenderer.cpp  |  21 +++
+ src/lib/MCCore/platform/MCVulkanRenderer.h    |   3 +
+ src/lib/MCCore/platform/MCVulkanShaders.cpp   |  39 +++++
+ src/mac/generated/shaders/composite.msl.h     | 136 ++++++++++++++++++
+ src/mac/generated/shaders/draw.msl.h          | 128 +++++++++++++++++
+ src/mac/generated/shaders/instance.msl.h      |  32 +++++
+ src/mac/generated/shaders/quad.msl.h          |  17 +++
+ src/mac/generated/shaders/terrain.msl.h       |  84 +++++++++++
+ 10 files changed, 479 insertions(+), 1 deletion(-)
+ create mode 100644 src/mac/generated/shaders/composite.msl.h
+ create mode 100644 src/mac/generated/shaders/draw.msl.h
+ create mode 100644 src/mac/generated/shaders/instance.msl.h
+ create mode 100644 src/mac/generated/shaders/quad.msl.h
+ create mode 100644 src/mac/generated/shaders/terrain.msl.h
+
+diff --git a/src/apps/MCRedux/Main.cpp b/src/apps/MCRedux/Main.cpp
+index e58c8cc..dfba5bc 100644
+--- a/src/apps/MCRedux/Main.cpp
++++ b/src/apps/MCRedux/Main.cpp
+@@ -123,6 +123,19 @@ namespace
+             }
+         }
+ 
++#if defined(__APPLE__)
++        // Mac port: an app bundle can't pass arguments, so its Info.plist sets these (LSEnvironment).
++        if (const char* data = SDL_getenv("MCREDUX_DATA"); options.DataFolder.empty() && data != nullptr && *data != 0)
++        {
++            options.DataFolder = data;
++        }
++
++        if (const char* user = SDL_getenv("MCREDUX_USER"); options.UserFolder.empty() && user != nullptr && *user != 0)
++        {
++            options.UserFolder = user;
++        }
++#endif
++
+         auto dataFolder = FindGameData(options.DataFolder);
+ 
+         if (!dataFolder)
+diff --git a/src/lib/MCCore/platform/MCVulkanPresenter.cpp b/src/lib/MCCore/platform/MCVulkanPresenter.cpp
+index 7c923d5..1ad3b0a 100644
+--- a/src/lib/MCCore/platform/MCVulkanPresenter.cpp
++++ b/src/lib/MCCore/platform/MCVulkanPresenter.cpp
+@@ -47,7 +47,12 @@ std::expected<std::unique_ptr<MCVulkanPresenter>, std::string> MCVulkanPresenter
+     auto presenter = std::make_unique<MCVulkanPresenter>(Key{});
+     presenter->_Window = std::move(window);
+     presenter->_Presentation = presentation;
++#if defined(__APPLE__)
++    // Mac port: the GPU renderer on Metal, with the MSL shaders (MCVulkanShaders).
++    SDL_GPUDevice* device = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_MSL, false, "metal");
++#else
+     SDL_GPUDevice* device = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV, false, "vulkan");
++#endif
+ 
+     if (device == nullptr)
+     {
+@@ -574,7 +579,7 @@ void MCVulkanPresenter::Composite(SDL_GPUCommandBuffer& commands, const MCFrame&
+              static_cast<float>(underlay.Rect.X1 - underlay.Rect.X0 + 1) / mapX,
+              static_cast<float>(underlay.Rect.Y1 - underlay.Rect.Y0 + 1) / mapY},
+             {worldSize[0], worldSize[1], worldSize[2], worldSize[3]},
+-            {1.0f, source, 0.0f, 0.0f},
++            {1.0f, source, gpuSurfaces && MCPixelArtUpscale() ? 1.0f : 0.0f, 0.0f},
+         };
+ 
+         draw((static_cast<float>(x0) - originX) / mapX, (static_cast<float>(y0) - originY) / mapY,
+diff --git a/src/lib/MCCore/platform/MCVulkanRenderer.cpp b/src/lib/MCCore/platform/MCVulkanRenderer.cpp
+index 1d6fbdd..858d6ef 100644
+--- a/src/lib/MCCore/platform/MCVulkanRenderer.cpp
++++ b/src/lib/MCCore/platform/MCVulkanRenderer.cpp
+@@ -2642,6 +2642,21 @@ void MCVulkanRenderer::TakeCopy(SDL_GPUCommandBuffer& commands, Surface& surface
+     SDL_EndGPUCopyPass(pass);
+ }
+ 
++bool MCPixelArtUpscale()
++{
++    // Mac port: on by default on Apple; MCREDUX_UPSCALE=0 turns it off (the original nearest-pixel scaling).
++    static const bool enabled = []
++    {
++#if defined(__APPLE__)
++        const char* value = SDL_getenv("MCREDUX_UPSCALE");
++        return value == nullptr || std::string_view(value) != "0";
++#else
++        return false;
++#endif
++    }();
++    return enabled;
++}
++
+ void MCVulkanRenderer::PlaceSurfaces(std::span<const MCUnderlay> underlays)
+ {
+     for (Surface& surface : _Surfaces)
+@@ -2654,6 +2669,12 @@ void MCVulkanRenderer::PlaceSurfaces(std::span<const MCUnderlay> underlays)
+             continue;
+         }
+ 
++        // Mac port: with the pixel-art upscale the world keeps its own (1x) size and the composite enlarges it.
++        if (MCPixelArtUpscale())
++        {
++            continue;
++        }
++
+         for (const MCUnderlay& underlay : underlays)
+         {
+             if (SourceSurfaceKey(underlay) == surface.Key && !Empty(underlay.Rect))
+diff --git a/src/lib/MCCore/platform/MCVulkanRenderer.h b/src/lib/MCCore/platform/MCVulkanRenderer.h
+index 93c4e41..233292d 100644
+--- a/src/lib/MCCore/platform/MCVulkanRenderer.h
++++ b/src/lib/MCCore/platform/MCVulkanRenderer.h
+@@ -1,5 +1,8 @@
+ #pragma once
+ 
++/// <summary>Mac port: draw the world at its own size and enlarge it with the xBR filter in the composite.</summary>
++bool MCPixelArtUpscale();
++
+ #include "platform/MCPresenter.h"
+ #include "platform/MCSdlHandle.h"
+ #include "platform/MCSoftwareRenderer.h"
+diff --git a/src/lib/MCCore/platform/MCVulkanShaders.cpp b/src/lib/MCCore/platform/MCVulkanShaders.cpp
+index 4baada9..ec0f642 100644
+--- a/src/lib/MCCore/platform/MCVulkanShaders.cpp
++++ b/src/lib/MCCore/platform/MCVulkanShaders.cpp
+@@ -6,6 +6,14 @@
+ #include "shaders/instance.spv.h"
+ #include "shaders/quad.spv.h"
+ #include "shaders/terrain.spv.h"
++#if defined(__APPLE__)
++// Mac port: the same shaders in MSL for SDL GPU's Metal driver (src/mac/generated/shaders).
++#include "shaders/composite.msl.h"
++#include "shaders/draw.msl.h"
++#include "shaders/instance.msl.h"
++#include "shaders/quad.msl.h"
++#include "shaders/terrain.msl.h"
++#endif
+ 
+ namespace MCVulkanShaders
+ {
+@@ -36,6 +44,28 @@ namespace MCVulkanShaders
+ 
+     std::span<const unsigned char> BuiltInCode(MCShader shader)
+     {
++#if defined(__APPLE__)
++        const auto text = [](const char* source) {
++            return std::span<const unsigned char>(reinterpret_cast<const unsigned char*>(source), std::strlen(source));
++        };
++
++        switch (shader)
++        {
++            case MCShader::Quad:
++                return text(MC_quad_msl);
++            case MCShader::Composite:
++                return text(MC_composite_msl);
++            case MCShader::Instance:
++                return text(MC_instance_msl);
++            case MCShader::Draw:
++                return text(MC_draw_msl);
++            case MCShader::Terrain:
++                return text(MC_terrain_msl);
++        }
++
++        return {};
++#endif
++
+         switch (shader)
+         {
+             case MCShader::Quad:
+@@ -107,15 +137,24 @@ namespace MCVulkanShaders
+         SDL_GPUShaderCreateInfo create{};
+         create.code = builtIn.data();
+         create.code_size = builtIn.size();
++#if defined(__APPLE__)
++        create.entrypoint = "main0";
++        create.format = SDL_GPU_SHADERFORMAT_MSL;
++#else
+         create.entrypoint = "main";
+         create.format = SDL_GPU_SHADERFORMAT_SPIRV;
++#endif
+         create.stage = info.Stage;
+         create.num_samplers = info.Samplers;
+         create.num_uniform_buffers = info.UniformBuffers;
+         create.num_storage_buffers = info.StorageBuffers;
+         std::vector<unsigned char> replacement;
+ 
++#if defined(__APPLE__)
++        if (const std::filesystem::path path{}; false)  // replacements on disk are SPIR-V
++#else
+         if (const std::filesystem::path path = FindReplacement(name); !path.empty())
++#endif
+         {
+             replacement = ReadFile(path);
+ 
+diff --git a/src/mac/generated/shaders/composite.msl.h b/src/mac/generated/shaders/composite.msl.h
+new file mode 100644
+index 0000000..b4c60e7
+--- /dev/null
++++ b/src/mac/generated/shaders/composite.msl.h
+@@ -0,0 +1,136 @@
++#pragma once
++// Mac port: composite.pshader in MSL (textures/samplers 0-4, uniforms [[buffer(0)]]).
++static const char MC_composite_msl[] = R"MSL(
++#include <metal_stdlib>
++using namespace metal;
++struct Composite {
++    float4 screenSize; float4 screenMap; float4 shown; float4 worldSize; float4 mode;
++    int4 cycle; uint4 cycleSources[2]; float4 fade;
++};
++static float4 Faded(constant Composite& c, float3 color) { return float4(saturate(color - c.fade.x), 1.0); }
++static uint Byte(float v) { return (uint)round(v * 255.0); }
++static float4 TexelAt(texture2d<float> tex, sampler s, float2 texel, float2 size) { return tex.sample(s, (texel + 0.5) / size); }
++static uint IndexAt(texture2d<float> tex, sampler s, float2 texel, float2 size) { return Byte(tex.sample(s, (texel + 0.5) / size).r); }
++static float3 Shown(constant Composite& c, texture2d<float> pal, sampler ps, uint index)
++{
++    const uint cycled = index - (uint)c.cycle.x;
++    if (c.cycle.y >= 0 && cycled < 8u)
++    {
++        const uint source = (cycled + (uint)c.cycle.y) & 7u;
++        index = c.cycleSources[source >> 2][source & 3u];
++    }
++    return pal.sample(ps, float2((index + 0.5) / 256.0, 0.5)).rgb;
++}
++
++// Mac port: xBR level 2 (after Hyllian's single-pass xBR-lv2), written for this composite: the world surface (premultiplied
++// RGBA, one texel per world pixel) enlarged to the shown rectangle with edge-directed interpolation instead of nearest.
++static float3 W(texture2d<float> t, float2 p, float2 size)
++{
++    const uint2 q = uint2(clamp(p, float2(0.0), size - 1.0));
++    return t.read(q).rgb;
++}
++static float4 Luma4(float3 a, float3 b, float3 c, float3 d)
++{
++    const float3 Y = float3(0.2126, 0.7152, 0.0722) * 48.0;
++    return float4(dot(a, Y), dot(b, Y), dot(c, Y), dot(d, Y));
++}
++static float4 Df(float4 a, float4 b) { return abs(a - b); }
++static bool4 Eq(float4 a, float4 b) { return Df(a, b) < 15.0; }
++static bool4 Neq(float4 a, float4 b) { return !Eq(a, b); }
++static float4 WD(float4 a, float4 b, float4 c, float4 d, float4 e, float4 f, float4 g, float4 h)
++{
++    return Df(a, b) + Df(a, c) + Df(d, e) + Df(d, f) + 4.0 * Df(g, h);
++}
++static float CDf(float3 a, float3 b) { const float3 d = abs(a - b); return d.r + d.g + d.b; }
++static float3 Xbr(texture2d<float> t, float2 uv, float2 size, float scale)
++{
++    // uv: the position in world texels (continuous); the centre texel and its fraction.
++    const float2 pos = floor(uv);
++    const float2 fp = uv - pos;
++    const float3 A1 = W(t, pos + float2(-1, -2), size), B1 = W(t, pos + float2(0, -2), size), C1 = W(t, pos + float2(1, -2), size);
++    const float3 A0 = W(t, pos + float2(-2, -1), size), A = W(t, pos + float2(-1, -1), size), B = W(t, pos + float2(0, -1), size);
++    const float3 C = W(t, pos + float2(1, -1), size), C4 = W(t, pos + float2(2, -1), size);
++    const float3 D0 = W(t, pos + float2(-2, 0), size), D = W(t, pos + float2(-1, 0), size), E = W(t, pos, size);
++    const float3 F = W(t, pos + float2(1, 0), size), F4 = W(t, pos + float2(2, 0), size);
++    const float3 G0 = W(t, pos + float2(-2, 1), size), G = W(t, pos + float2(-1, 1), size), H = W(t, pos + float2(0, 1), size);
++    const float3 I = W(t, pos + float2(1, 1), size), I4 = W(t, pos + float2(2, 1), size);
++    const float3 G5 = W(t, pos + float2(-1, 2), size), H5 = W(t, pos + float2(0, 2), size), I5 = W(t, pos + float2(1, 2), size);
++
++    const float4 b = Luma4(B, D, H, F), c = Luma4(C, A, G, I), e = Luma4(E, E, E, E);
++    const float4 d = b.yzwx, f = b.wxyz, g = c.zwxy, h = b.zwxy, i = c.wxyz;
++    const float4 i4 = Luma4(I4, C1, A0, G5), i5 = Luma4(I5, C4, A1, G0), h5 = Luma4(H5, F4, B1, D0), f4 = h5.yzwx;
++
++    const float4 Ao = float4(1.0, -1.0, -1.0, 1.0), Bo = float4(1.0, 1.0, -1.0, -1.0), Co = float4(1.5, 0.5, -0.5, 0.5);
++    const float4 Ax = float4(1.0, -1.0, -1.0, 1.0), Bx = float4(0.5, 2.0, -0.5, -2.0), Cx = float4(1.0, 1.0, -0.5, 0.0);
++    const float4 Ay = float4(1.0, -1.0, -1.0, 1.0), By = float4(2.0, 0.5, -2.0, -0.5), Cy = float4(2.0, 0.0, -1.0, 0.5);
++    const float4 Ci = float4(0.25);
++
++    const float4 fx = Ao * fp.y + Bo * fp.x;
++    const float4 fxLeft = Ax * fp.y + Bx * fp.x;
++    const float4 fxUp = Ay * fp.y + By * fp.x;
++
++    const bool4 lv0 = (e != f) && (e != h);
++    const bool4 lv1 = lv0 && ((Neq(f, b) && Neq(h, d)) || (Eq(e, i) && Neq(f, i4) && Neq(h, i5)) || Eq(e, g) || Eq(e, c));
++    const bool4 lv2Left = (e != g) && (d != g);
++    const bool4 lv2Up = (e != c) && (b != c);
++
++    const float4 delta = float4(1.0 / max(scale, 1.0));
++    const float4 fx45i = saturate((fx + delta - Co - Ci) / (2.0 * delta));
++    const float4 fx45 = saturate((fx + delta - Co) / (2.0 * delta));
++    const float4 fx30 = saturate((fxLeft + delta - Cx) / (2.0 * delta));
++    const float4 fx60 = saturate((fxUp + delta - Cy) / (2.0 * delta));
++
++    const float4 wd1 = WD(e, c, g, i, h5, f4, h, f);
++    const float4 wd2 = WD(h, d, i5, f, i4, b, e, i);
++    const bool4 edri = (wd1 <= wd2) && lv0;
++    const bool4 edr = (wd1 < wd2) && lv1;
++    const bool4 edrLeft = (2.0 * Df(f, g) <= Df(h, c)) && lv2Left && edr;
++    const bool4 edrUp = (Df(f, g) >= 2.0 * Df(h, c)) && lv2Up && edr;
++
++    const float4 m45 = float4(edr) * fx45, m30 = float4(edrLeft) * fx30, m60 = float4(edrUp) * fx60, m45i = float4(edri) * fx45i;
++    const bool4 px = Df(e, f) <= Df(e, h);
++    const float4 maximos = max(max(m30, m60), max(m45, m45i));
++
++    float3 res1 = E;
++    res1 = mix(res1, px.x ? F : H, maximos.x);
++    res1 = mix(res1, px.z ? D : B, maximos.z);
++    float3 res2 = E;
++    res2 = mix(res2, px.y ? B : F, maximos.y);
++    res2 = mix(res2, px.w ? H : D, maximos.w);
++    return CDf(E, res1) >= CDf(E, res2) ? res1 : res2;
++}
++fragment float4 main0(float4 position [[position]], constant Composite& c [[buffer(0)]],
++                      texture2d<float> screenTex [[texture(0)]], sampler screenSampler [[sampler(0)]],
++                      texture2d<float> opTex [[texture(1)]], sampler opSampler [[sampler(1)]],
++                      texture2d<float> worldTex [[texture(2)]], sampler worldSampler [[sampler(2)]],
++                      texture2d<float> tableTex [[texture(3)]], sampler tableSampler [[sampler(3)]],
++                      texture2d<float> paletteTex [[texture(4)]], sampler paletteSampler [[sampler(4)]])
++{
++    const float2 pixel = floor(position.xy);
++    const float2 screenPixel = c.screenMap.xy + floor((pixel + 0.5) * c.screenMap.zw);
++    const float4 screen = TexelAt(screenTex, screenSampler, screenPixel, c.screenSize.zw);
++    const float2 offset = pixel - c.shown.xy;
++    const float2 world = clamp(floor((2.0 * offset + 1.0) * c.worldSize.xy / (2.0 * c.shown.zw)), 0.0, c.worldSize.xy - 1.0);
++    if (c.mode.y != 0.0)
++    {
++        float3 under;
++        if (c.mode.x == 0.0) { under = Shown(c, paletteTex, paletteSampler, 255); }
++        else if (c.mode.z != 0.0)
++        {
++            // The world texel position under this pixel's centre, continuous (the xBR filter needs the fraction).
++            const float2 uv = (offset + 0.5) * c.worldSize.xy / c.shown.zw;
++            under = Xbr(worldTex, uv, c.worldSize.xy, c.shown.w / c.worldSize.y);
++        }
++        else { under = TexelAt(worldTex, worldSampler, world, c.worldSize.zw).rgb; }
++        return Faded(c, saturate(screen.rgb + under * (1.0 - screen.a)));
++    }
++    uint index = Byte(screen.r);
++    if (c.mode.x != 0.0 && index == 255)
++    {
++        index = Byte(TexelAt(worldTex, worldSampler, world, c.worldSize.zw).r);
++        const uint op = IndexAt(opTex, opSampler, screenPixel, c.screenSize.zw);
++        index = IndexAt(tableTex, tableSampler, float2(index, op), float2(256.0, 256.0));
++    }
++    return Faded(c, Shown(c, paletteTex, paletteSampler, index));
++}
++)MSL";
+diff --git a/src/mac/generated/shaders/draw.msl.h b/src/mac/generated/shaders/draw.msl.h
+new file mode 100644
+index 0000000..b324d96
+--- /dev/null
++++ b/src/mac/generated/shaders/draw.msl.h
+@@ -0,0 +1,128 @@
++#pragma once
++// Mac port: draw.pshader in MSL (textures/samplers 0-4, uniforms [[buffer(0)]], two colour targets).
++static const char MC_draw_msl[] = R"MSL(
++#include <metal_stdlib>
++using namespace metal;
++struct Frame { int4 scale; int4 sourceScale; int4 cycle; uint4 cycleSources[2]; };
++struct Input {
++    float4 position [[position]];
++    int4 rect [[flat]]; int4 source [[flat]]; uint4 op [[flat]]; int4 span [[flat]]; uint4 walk [[flat]];
++};
++struct Output { float4 color [[color(0)]]; float4 index [[color(1)]]; };
++constant uint KindHash = 1; constant uint KindTexture = 2; constant uint KindGouraud = 3; constant uint KindTexelWalk = 4;
++constant uint OpaqueSource = 1u << 4; constant uint FillSkipped = 1u << 5; constant uint SkipRunKey = 1u << 6;
++constant uint TableBefore = 1u << 7; constant uint SkipKeyAfterTable = 1u << 8; constant uint ColorKey = 1u << 9;
++constant uint UseColor = 1u << 10; constant uint AlphaBlend = 1u << 12; constant uint TableAfter = 1u << 13;
++constant uint GivenAlpha = 1u << 14;
++constant uint AlphaNothing = 0; constant uint AlphaOpaque = 1;
++
++struct Tex {
++    texture2d<float> source; sampler sourceS; texture2d<float> table; sampler tableS;
++    texture2d<float> alpha; sampler alphaS; texture2d<float> fit; sampler fitS;
++    texture2d<float> palette; sampler paletteS;
++};
++static float4 Fetch(texture2d<float> tex, sampler s, int2 texel)
++{
++    return tex.sample(s, (float2(texel) + 0.5) / float2(tex.get_width(), tex.get_height()), level(0));
++}
++static uint Byte(float v) { return (uint)round(v * 255.0); }
++static uint Table(thread const Tex& t, uint row, uint index) { return Byte(Fetch(t.table, t.tableS, int2(index, row)).r); }
++static float3 Shown(constant Frame& f, thread const Tex& t, uint index)
++{
++    const uint cycled = index - (uint)f.cycle.x;
++    if (f.cycle.y >= 0 && cycled < 8u)
++    {
++        const uint source = (cycled + (uint)f.cycle.y) & 7u;
++        index = f.cycleSources[source >> 2][source & 3u];
++    }
++    return Fetch(t.palette, t.paletteS, int2(index, 0)).rgb;
++}
++static Output Opaque(constant Frame& f, thread const Tex& t, uint index)
++{
++    Output o;
++    o.color = f.cycle.z != 0 && index == 255 ? float4(0.0) : float4(Shown(f, t, index), 1.0);
++    o.index = float4((float)index / 255.0, 0.0, 0.0, 0.0);
++    return o;
++}
++static Output Blended(float4 color) { Output o; o.color = color; o.index = float4(0.0); return o; }
++static int2 WindowPixel(int2 p, int4 s) { return int2((2u * uint2(p) + 1u) * uint2(s.xy) / (2u * uint2(s.zw))); }
++static int2 DrawnPixel(int2 t, int4 s) { return int2((2u * uint2(t) + 1u) * uint2(s.zw) / (2u * uint2(s.xy))); }
++
++fragment Output main0(Input input [[stage_in]], constant Frame& f [[buffer(0)]],
++                      texture2d<float> sourceTex [[texture(0)]], sampler sourceSampler [[sampler(0)]],
++                      texture2d<float> tableTex [[texture(1)]], sampler tableSampler [[sampler(1)]],
++                      texture2d<float> alphaTex [[texture(2)]], sampler alphaSampler [[sampler(2)]],
++                      texture2d<float> fitTex [[texture(3)]], sampler fitSampler [[sampler(3)]],
++                      texture2d<float> paletteTex [[texture(4)]], sampler paletteSampler [[sampler(4)]])
++{
++    Tex t = { sourceTex, sourceSampler, tableTex, tableSampler, alphaTex, alphaSampler, fitTex, fitSampler, paletteTex, paletteSampler };
++    const int2 target = int2(floor(input.position.xy));
++    const int2 pixel = WindowPixel(target, f.scale);
++    if (any(pixel < input.rect.xy) || any(pixel > input.rect.zw)) { discard_fragment(); }
++    const uint flags = input.op.x;
++    const uint kind = flags & 15u;
++    const uint color = input.op.y & 255u;
++    uint value = color;
++    uint state = 1;
++    if (kind == KindHash)
++    {
++        const int odd = (input.span.y - pixel.y) & 1;
++        const int column = pixel.x - input.span.x - odd;
++        if (column < 0 || (column & 1) != 0) { discard_fragment(); }
++    }
++    else if (kind == KindTexture)
++    {
++        const int2 texel = input.source.xy + (pixel - input.rect.xy) * input.source.zw;
++        const float4 s = Fetch(t.source, t.sourceS, DrawnPixel(texel, f.sourceScale));
++        value = Byte(s.r);
++        state = (flags & OpaqueSource) != 0 ? 1 : Byte(s.g);
++    }
++    else if (kind == KindGouraud)
++    {
++        const uint j = (uint)(pixel.x - input.source.x);
++        value = (((uint)input.span.x + j * (uint)input.span.y) >> 16) & 255u;
++    }
++    else if (kind == KindTexelWalk)
++    {
++        const uint j = (uint)(pixel.x - input.source.x);
++        const int carriesU = (int)((input.walk.x + j * input.walk.y) >> 16);
++        const int carriesV = (int)((input.walk.z + j * input.walk.w) >> 16);
++        const int offset = input.span.x + (int)j * input.span.y + carriesU * input.span.z + carriesV * input.span.w;
++        if (offset < 0 || offset >= input.source.z * input.source.w) { discard_fragment(); }
++        value = Byte(Fetch(t.source, t.sourceS, DrawnPixel(int2(offset % input.source.z, offset / input.source.z), f.sourceScale)).r);
++    }
++    if (state == 0) { discard_fragment(); }
++    if (state == 2)
++    {
++        if ((flags & FillSkipped) == 0) { discard_fragment(); }
++        return Opaque(f, t, 0);
++    }
++    if ((flags & UseColor) != 0) { value = color; }
++    if ((flags & SkipRunKey) != 0 && state == 3 && value == 255) { discard_fragment(); }
++    if ((flags & ColorKey) != 0 && value == ((input.op.y >> 8) & 255u)) { discard_fragment(); }
++    if ((flags & TableBefore) != 0) { value = Table(t, input.op.z, value); }
++    if ((flags & SkipKeyAfterTable) != 0 && value == 255) { discard_fragment(); }
++    if ((flags & (AlphaBlend | TableAfter)) == 0) { return Opaque(f, t, value); }
++    float4 blend = float4(0.0);
++    bool opaque = false;
++    if ((flags & AlphaBlend) != 0)
++    {
++        const uint entry = (flags & GivenAlpha) != 0 ? input.op.w : value;
++        const uint alphaKind = (uint)round(Fetch(t.alpha, t.alphaS, int2(entry, 0)).x);
++        if (alphaKind == AlphaNothing && (flags & TableAfter) == 0) { discard_fragment(); }
++        opaque = alphaKind == AlphaOpaque;
++        blend = Fetch(t.alpha, t.alphaS, int2(entry, 1));
++    }
++    if ((flags & TableAfter) != 0)
++    {
++        if (opaque) { value = Table(t, input.op.w, value); }
++        else
++        {
++            const float4 fit = Fetch(t.fit, t.fitS, int2(0, input.op.w));
++            blend = float4(blend.rgb * (1.0 - fit.a) + fit.rgb, 1.0 - (1.0 - blend.a) * (1.0 - fit.a));
++        }
++    }
++    if (opaque) { return Opaque(f, t, value); }
++    return Blended(blend);
++}
++)MSL";
+diff --git a/src/mac/generated/shaders/instance.msl.h b/src/mac/generated/shaders/instance.msl.h
+new file mode 100644
+index 0000000..65a2681
+--- /dev/null
++++ b/src/mac/generated/shaders/instance.msl.h
+@@ -0,0 +1,32 @@
++#pragma once
++// Mac port: instance.vshader in MSL (uniforms [[buffer(0)]], then the draws storage buffer [[buffer(1)]]).
++static const char MC_instance_msl[] = R"MSL(
++#include <metal_stdlib>
++using namespace metal;
++struct Draw { int4 rect; int4 source; uint4 op; int4 span; uint4 walk; };
++struct Batch { float4 targetSize; uint4 batch; };
++struct Output {
++    float4 position [[position]];
++    int4 rect [[flat]]; int4 source [[flat]]; uint4 op [[flat]]; int4 span [[flat]]; uint4 walk [[flat]];
++};
++constant float2 corners[6] = { float2(0.0, 0.0), float2(1.0, 0.0), float2(0.0, 1.0),
++                               float2(0.0, 1.0), float2(1.0, 0.0), float2(1.0, 1.0) };
++vertex Output main0(uint vid [[vertex_id]], uint iid [[instance_id]],
++                    constant Batch& b [[buffer(0)]], const device Draw* draws [[buffer(1)]])
++{
++    const Draw draw = draws[b.batch.x + iid];
++    const float2 topLeft = float2(draw.rect.xy);
++    const float2 size = float2(draw.rect.zw - draw.rect.xy + 1);
++    const float2 pixel = topLeft + corners[vid] * size;
++    float2 ndc = pixel / b.targetSize.xy * 2.0 - 1.0;
++    if (any(b.targetSize.zw != b.targetSize.xy))
++    {
++        ndc += (corners[vid] * 2.0 - 1.0) * 2.0 / b.targetSize.zw;
++    }
++    ndc.y = -ndc.y;
++    Output o;
++    o.position = float4(ndc, 0.0, 1.0);
++    o.rect = draw.rect; o.source = draw.source; o.op = draw.op; o.span = draw.span; o.walk = draw.walk;
++    return o;
++}
++)MSL";
+diff --git a/src/mac/generated/shaders/quad.msl.h b/src/mac/generated/shaders/quad.msl.h
+new file mode 100644
+index 0000000..85ed0b2
+--- /dev/null
++++ b/src/mac/generated/shaders/quad.msl.h
+@@ -0,0 +1,17 @@
++#pragma once
++// Mac port: quad.vshader in MSL (SDL GPU Metal bindings: uniforms [[buffer(0)]]).
++static const char MC_quad_msl[] = R"MSL(
++#include <metal_stdlib>
++using namespace metal;
++struct Quad { float4 rect; float4 targetSize; };
++struct QuadOut { float4 position [[position]]; };
++constant float2 corners[6] = { float2(0.0, 0.0), float2(1.0, 0.0), float2(0.0, 1.0),
++                               float2(0.0, 1.0), float2(1.0, 0.0), float2(1.0, 1.0) };
++vertex QuadOut main0(uint vid [[vertex_id]], constant Quad& q [[buffer(0)]])
++{
++    const float2 pixel = q.rect.xy + corners[vid] * q.rect.zw;
++    float2 ndc = pixel / q.targetSize.xy * 2.0 - 1.0;
++    ndc.y = -ndc.y;
++    QuadOut o; o.position = float4(ndc, 0.0, 1.0); return o;
++}
++)MSL";
+diff --git a/src/mac/generated/shaders/terrain.msl.h b/src/mac/generated/shaders/terrain.msl.h
+new file mode 100644
+index 0000000..b4708f9
+--- /dev/null
++++ b/src/mac/generated/shaders/terrain.msl.h
+@@ -0,0 +1,84 @@
++#pragma once
++// Mac port: terrain.vshader in MSL (fog [[texture(0)]]/[[sampler(0)]]; uniforms [[buffer(0)]], cells [[buffer(1)]],
++// images [[buffer(2)]]).
++static const char MC_terrain_msl[] = R"MSL(
++#include <metal_stdlib>
++using namespace metal;
++struct Image { int4 atlas; int4 hot; };
++struct Terrain { float4 targetSize; int4 origin; int4 steps; int4 mesh; int4 grid; int4 corners; int4 clip; uint4 haze; int4 pane; };
++struct Output {
++    float4 position [[position]];
++    int4 rect [[flat]]; int4 source [[flat]]; uint4 op [[flat]]; int4 span [[flat]]; uint4 walk [[flat]];
++};
++constant float2 quadCorners[6] = { float2(0.0, 0.0), float2(1.0, 0.0), float2(0.0, 1.0),
++                            float2(0.0, 1.0), float2(1.0, 0.0), float2(1.0, 1.0) };
++constant uint KindTexture = 2;
++constant uint TableBefore = 1u << 7;
++constant uint UseColor = 1u << 10;
++
++static int2 Point(constant Terrain& t, int row, int col, uint e)
++{
++    return t.origin.xy + int2((col - row) * t.steps.x, (row + col) * t.steps.y - (int)e * t.origin.z);
++}
++static bool Clipped(constant Terrain& t, int2 p)
++{
++    return p.x < t.corners.x || p.x > t.corners.y || p.y < t.corners.z || p.y > t.corners.w;
++}
++static uint Seen(constant Terrain& t, texture2d<float> fogTex, sampler fogSampler, int row, int col)
++{
++    const uint r = (uint)row;
++    const uint c = (uint)col & 0xffffu;
++    const uint columns = (uint)t.mesh.z;
++    const uint rows = (uint)t.mesh.w;
++    if (r >= rows || c > columns) { return 0; }
++    const uint index = columns * r + c;
++    if (index >= columns * rows) { return 0; }
++    const float flag = fogTex.sample(fogSampler, (float2(index % columns, index / columns) + 0.5) / float2(columns, rows), level(0)).r;
++    return (uint)round(flag * 255.0) == 255u ? 1u : 0u;
++}
++static Output Nothing()
++{
++    Output o;
++    o.position = float4(2.0, 2.0, 0.0, 1.0);
++    o.rect = int4(0, 0, -1, -1); o.source = int4(0); o.op = uint4(0); o.span = int4(0); o.walk = uint4(0);
++    return o;
++}
++vertex Output main0(uint vid [[vertex_id]], uint iid [[instance_id]],
++                    texture2d<float> fogTex [[texture(0)]], sampler fogSampler [[sampler(0)]],
++                    constant Terrain& t [[buffer(0)]], const device uint2* cells [[buffer(1)]],
++                    const device Image* images [[buffer(2)]])
++{
++    const uint index = (uint)t.origin.w + iid;
++    const int row = t.steps.z + (int)(index / (uint)t.mesh.x);
++    const int col = t.steps.w + (int)(index % (uint)t.mesh.x);
++    const uint2 cell = cells[index];
++    if (cell.x == 0xffffffffu || row < t.grid.x || col < t.grid.y || row > t.grid.z || col > t.grid.w) { return Nothing(); }
++    const uint4 e = uint4(cell.y & 255u, (cell.y >> 8) & 255u, (cell.y >> 16) & 255u, cell.y >> 24);
++    const int2 topLeft = Point(t, row, col, e.x);
++    if (Clipped(t, topLeft) && Clipped(t, Point(t, row, col + 1, e.y)) && Clipped(t, Point(t, row + 1, col + 1, e.z)) &&
++        Clipped(t, Point(t, row + 1, col, e.w))) { return Nothing(); }
++    const Image image = images[cell.x];
++    const int2 at = t.pane.xy + topLeft - image.hot.xy;
++    const int4 box = int4(at, at + image.atlas.zw - 1);
++    const int4 cut = int4(max(box.xy, t.clip.xy), min(box.zw, t.clip.zw));
++    if (cut.z < cut.x || cut.w < cut.y) { return Nothing(); }
++    uint flags = KindTexture; uint color = 0; uint before = 0; uint seen = 0;
++    if (t.haze.x == 0)
++    {
++        seen = Seen(t, fogTex, fogSampler, row, col) + Seen(t, fogTex, fogSampler, row, col + 1) +
++               Seen(t, fogTex, fogSampler, row + 1, col + 1) + Seen(t, fogTex, fogSampler, row + 1, col);
++    }
++    if (t.haze.x != 0 || seen == 0) { flags |= UseColor; color = 0x10; }
++    else if (seen != 4) { flags |= TableBefore; before = seen == 1 ? t.haze.y : (seen == 2 ? t.haze.z : t.haze.w); }
++    const float2 corner = quadCorners[vid];
++    const float2 pixel = float2(cut.xy) + corner * float2(cut.zw - cut.xy + 1);
++    float2 ndc = pixel / t.targetSize.xy * 2.0 - 1.0;
++    if (any(t.targetSize.zw != t.targetSize.xy)) { ndc += (corner * 2.0 - 1.0) * 2.0 / t.targetSize.zw; }
++    ndc.y = -ndc.y;
++    Output o;
++    o.position = float4(ndc, 0.0, 1.0);
++    o.rect = cut; o.source = int4(image.atlas.xy + cut.xy - at, 1, 1); o.op = uint4(flags, color, before, 0);
++    o.span = int4(0); o.walk = uint4(0);
++    return o;
++}
++)MSL";

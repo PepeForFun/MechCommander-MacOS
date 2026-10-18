@@ -1,0 +1,71 @@
+From 385775d91a89a37693cdd8d6e7f0d251c4ea1c4d Mon Sep 17 00:00:00 2001
+From: MechCommander Redux Mac port <mac-port@users.noreply.invalid>
+Date: Sun, 18 Oct 2026 11:30:45 +0200
+Subject: [PATCH 8/9] keys.cfg is written at start-up (editable before the
+ first mission)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/MCRedux/Main.cpp                    |  2 ++
+ src/lib/MCCore/iface/MCTacticalInterface.cpp | 13 +++++++++++++
+ src/lib/MCCore/iface/MCTacticalInterface.h   |  3 +++
+ 3 files changed, 18 insertions(+)
+
+diff --git a/src/apps/MCRedux/Main.cpp b/src/apps/MCRedux/Main.cpp
+index 382196d..e9fe0d7 100644
+--- a/src/apps/MCRedux/Main.cpp
++++ b/src/apps/MCRedux/Main.cpp
+@@ -4,6 +4,7 @@
+ #include "MCVersion.h"
+ #include "abl/MCAblRuntime.h"
+ #include "gui/MCGuiStartup.h"
++#include "iface/MCTacticalInterface.h"
+ #include "platform/MCAllocator.h"
+ #include "platform/MCFileSystem.h"
+ 
+@@ -326,6 +327,7 @@ int main(int argc, char** argv)
+ 
+     MCFileSystem::SetGameRoot(options->DataFolder);
+     MCFileSystem::SetUserRoot(options->UserFolder);
++    MCWriteDefaultKeyConfig();
+     SDL_Log("Game data: %s", options->DataFolder.string().c_str());
+     SDL_Log("User data: %s", options->UserFolder.string().c_str());
+ 
+diff --git a/src/lib/MCCore/iface/MCTacticalInterface.cpp b/src/lib/MCCore/iface/MCTacticalInterface.cpp
+index 816cecd..d3440fb 100644
+--- a/src/lib/MCCore/iface/MCTacticalInterface.cpp
++++ b/src/lib/MCCore/iface/MCTacticalInterface.cpp
+@@ -627,6 +627,19 @@ MCTacticalInterface::~MCTacticalInterface()
+     }
+ }
+ 
++void MCWriteDefaultKeyConfig()
++{
++    // Port: keys.cfg with the default bindings at start-up, so it can be edited before the first mission.
++    std::array<uint32_t, NumKeyCommands> keys{};
++
++    for (const MCDefaultKey& binding : DefaultKeys)
++    {
++        BindKey(keys[static_cast<size_t>(binding.Command)], binding.Code, binding.Modifiers);
++    }
++
++    WriteKeyConfigIfMissing(keys);
++}
++
+ auto MCTacticalInterface::Init() -> int32_t
+ {
+     ReleaseScrollKeys();
+diff --git a/src/lib/MCCore/iface/MCTacticalInterface.h b/src/lib/MCCore/iface/MCTacticalInterface.h
+index c4c6bad..5ed323b 100644
+--- a/src/lib/MCCore/iface/MCTacticalInterface.h
++++ b/src/lib/MCCore/iface/MCTacticalInterface.h
+@@ -34,6 +34,9 @@ class MCViewWindow;
+ /// (a bitfield struct in the original).
+ /// </para>
+ /// </remarks>
++/// <summary>Port: writes keys.cfg (the default key bindings) into the user folder when it is missing.</summary>
++void MCWriteDefaultKeyConfig();
++
+ class MCTacticalInterface
+ {
+ public:

@@ -1,0 +1,117 @@
+From 6023166d8e65dd3c3395db17e12867381745dd32 Mon Sep 17 00:00:00 2001
+From: MechCommander Redux Mac port <mac-port@users.noreply.invalid>
+Date: Sun, 18 Oct 2026 10:36:40 +0200
+Subject: [PATCH 3/9] Mac port: xBR filter on the scaled screen (HUD, menus)
+ too, with coverage in the edge test
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/lib/MCCore/platform/MCVulkanPresenter.cpp |  2 +-
+ src/mac/generated/shaders/composite.msl.h     | 43 +++++++++++--------
+ 2 files changed, 26 insertions(+), 19 deletions(-)
+
+diff --git a/src/lib/MCCore/platform/MCVulkanPresenter.cpp b/src/lib/MCCore/platform/MCVulkanPresenter.cpp
+index 1ad3b0a..daec8e4 100644
+--- a/src/lib/MCCore/platform/MCVulkanPresenter.cpp
++++ b/src/lib/MCCore/platform/MCVulkanPresenter.cpp
+@@ -513,7 +513,7 @@ void MCVulkanPresenter::Composite(SDL_GPUCommandBuffer& commands, const MCFrame&
+                            {screenMap[0], screenMap[1], screenMap[2], screenMap[3]},
+                            {0.0f, 0.0f, 1.0f, 1.0f},
+                            {1.0f, 1.0f, 1.0f, 1.0f},
+-                           {0.0f, source, 0.0f, 0.0f}});
++                           {0.0f, source, gpuSurfaces && MCPixelArtUpscale() ? 1.0f : 0.0f, 0.0f}});
+ 
+     for (size_t i = 0; i < frame.Underlays.size(); ++i)
+     {
+diff --git a/src/mac/generated/shaders/composite.msl.h b/src/mac/generated/shaders/composite.msl.h
+index b4c60e7..2ff0ff2 100644
+--- a/src/mac/generated/shaders/composite.msl.h
++++ b/src/mac/generated/shaders/composite.msl.h
+@@ -24,14 +24,15 @@ static float3 Shown(constant Composite& c, texture2d<float> pal, sampler ps, uin
+ 
+ // Mac port: xBR level 2 (after Hyllian's single-pass xBR-lv2), written for this composite: the world surface (premultiplied
+ // RGBA, one texel per world pixel) enlarged to the shown rectangle with edge-directed interpolation instead of nearest.
+-static float3 W(texture2d<float> t, float2 p, float2 size)
++static float4 W(texture2d<float> t, float2 p, float2 size)
+ {
+     const uint2 q = uint2(clamp(p, float2(0.0), size - 1.0));
+-    return t.read(q).rgb;
++    return t.read(q);
+ }
+-static float4 Luma4(float3 a, float3 b, float3 c, float3 d)
++static float4 Luma4(float4 a, float4 b, float4 c, float4 d)
+ {
+-    const float3 Y = float3(0.2126, 0.7152, 0.0722) * 48.0;
++    // Luma plus coverage, so an edge between drawn and see-through pixels counts as an edge.
++    const float4 Y = float4(0.2126, 0.7152, 0.0722, 0.5) * 48.0;
+     return float4(dot(a, Y), dot(b, Y), dot(c, Y), dot(d, Y));
+ }
+ static float4 Df(float4 a, float4 b) { return abs(a - b); }
+@@ -41,20 +42,20 @@ static float4 WD(float4 a, float4 b, float4 c, float4 d, float4 e, float4 f, flo
+ {
+     return Df(a, b) + Df(a, c) + Df(d, e) + Df(d, f) + 4.0 * Df(g, h);
+ }
+-static float CDf(float3 a, float3 b) { const float3 d = abs(a - b); return d.r + d.g + d.b; }
+-static float3 Xbr(texture2d<float> t, float2 uv, float2 size, float scale)
++static float CDf(float4 a, float4 b) { const float4 d = abs(a - b); return d.r + d.g + d.b + d.a; }
++static float4 Xbr(texture2d<float> t, float2 uv, float2 size, float scale)
+ {
+     // uv: the position in world texels (continuous); the centre texel and its fraction.
+     const float2 pos = floor(uv);
+     const float2 fp = uv - pos;
+-    const float3 A1 = W(t, pos + float2(-1, -2), size), B1 = W(t, pos + float2(0, -2), size), C1 = W(t, pos + float2(1, -2), size);
+-    const float3 A0 = W(t, pos + float2(-2, -1), size), A = W(t, pos + float2(-1, -1), size), B = W(t, pos + float2(0, -1), size);
+-    const float3 C = W(t, pos + float2(1, -1), size), C4 = W(t, pos + float2(2, -1), size);
+-    const float3 D0 = W(t, pos + float2(-2, 0), size), D = W(t, pos + float2(-1, 0), size), E = W(t, pos, size);
+-    const float3 F = W(t, pos + float2(1, 0), size), F4 = W(t, pos + float2(2, 0), size);
+-    const float3 G0 = W(t, pos + float2(-2, 1), size), G = W(t, pos + float2(-1, 1), size), H = W(t, pos + float2(0, 1), size);
+-    const float3 I = W(t, pos + float2(1, 1), size), I4 = W(t, pos + float2(2, 1), size);
+-    const float3 G5 = W(t, pos + float2(-1, 2), size), H5 = W(t, pos + float2(0, 2), size), I5 = W(t, pos + float2(1, 2), size);
++    const float4 A1 = W(t, pos + float2(-1, -2), size), B1 = W(t, pos + float2(0, -2), size), C1 = W(t, pos + float2(1, -2), size);
++    const float4 A0 = W(t, pos + float2(-2, -1), size), A = W(t, pos + float2(-1, -1), size), B = W(t, pos + float2(0, -1), size);
++    const float4 C = W(t, pos + float2(1, -1), size), C4 = W(t, pos + float2(2, -1), size);
++    const float4 D0 = W(t, pos + float2(-2, 0), size), D = W(t, pos + float2(-1, 0), size), E = W(t, pos, size);
++    const float4 F = W(t, pos + float2(1, 0), size), F4 = W(t, pos + float2(2, 0), size);
++    const float4 G0 = W(t, pos + float2(-2, 1), size), G = W(t, pos + float2(-1, 1), size), H = W(t, pos + float2(0, 1), size);
++    const float4 I = W(t, pos + float2(1, 1), size), I4 = W(t, pos + float2(2, 1), size);
++    const float4 G5 = W(t, pos + float2(-1, 2), size), H5 = W(t, pos + float2(0, 2), size), I5 = W(t, pos + float2(1, 2), size);
+ 
+     const float4 b = Luma4(B, D, H, F), c = Luma4(C, A, G, I), e = Luma4(E, E, E, E);
+     const float4 d = b.yzwx, f = b.wxyz, g = c.zwxy, h = b.zwxy, i = c.wxyz;
+@@ -91,10 +92,10 @@ static float3 Xbr(texture2d<float> t, float2 uv, float2 size, float scale)
+     const bool4 px = Df(e, f) <= Df(e, h);
+     const float4 maximos = max(max(m30, m60), max(m45, m45i));
+ 
+-    float3 res1 = E;
++    float4 res1 = E;
+     res1 = mix(res1, px.x ? F : H, maximos.x);
+     res1 = mix(res1, px.z ? D : B, maximos.z);
+-    float3 res2 = E;
++    float4 res2 = E;
+     res2 = mix(res2, px.y ? B : F, maximos.y);
+     res2 = mix(res2, px.w ? H : D, maximos.w);
+     return CDf(E, res1) >= CDf(E, res2) ? res1 : res2;
+@@ -108,7 +109,13 @@ fragment float4 main0(float4 position [[position]], constant Composite& c [[buff
+ {
+     const float2 pixel = floor(position.xy);
+     const float2 screenPixel = c.screenMap.xy + floor((pixel + 0.5) * c.screenMap.zw);
+-    const float4 screen = TexelAt(screenTex, screenSampler, screenPixel, c.screenSize.zw);
++    float4 screen = TexelAt(screenTex, screenSampler, screenPixel, c.screenSize.zw);
++    if (c.mode.y != 0.0 && c.mode.z != 0.0 && c.screenMap.z < 0.999)
++    {
++        // Mac port: the screen (UI) shown scaled up, through the same xBR filter.
++        const float2 uvScreen = c.screenMap.xy + (pixel + 0.5) * c.screenMap.zw;
++        screen = Xbr(screenTex, uvScreen, c.screenSize.xy, 1.0 / c.screenMap.z);
++    }
+     const float2 offset = pixel - c.shown.xy;
+     const float2 world = clamp(floor((2.0 * offset + 1.0) * c.worldSize.xy / (2.0 * c.shown.zw)), 0.0, c.worldSize.xy - 1.0);
+     if (c.mode.y != 0.0)
+@@ -119,7 +126,7 @@ fragment float4 main0(float4 position [[position]], constant Composite& c [[buff
+         {
+             // The world texel position under this pixel's centre, continuous (the xBR filter needs the fraction).
+             const float2 uv = (offset + 0.5) * c.worldSize.xy / c.shown.zw;
+-            under = Xbr(worldTex, uv, c.worldSize.xy, c.shown.w / c.worldSize.y);
++            under = Xbr(worldTex, uv, c.worldSize.xy, c.shown.w / c.worldSize.y).rgb;
+         }
+         else { under = TexelAt(worldTex, worldSampler, world, c.worldSize.zw).rgb; }
+         return Faded(c, saturate(screen.rgb + under * (1.0 - screen.a)));

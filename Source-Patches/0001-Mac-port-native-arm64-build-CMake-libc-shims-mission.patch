@@ -1,0 +1,658 @@
+From de83efdafc28838a4bf98d6b98b48544680724ad Mon Sep 17 00:00:00 2001
+From: MechCommander Redux Mac port <mac-port@users.noreply.invalid>
+Date: Sun, 18 Oct 2026 10:07:19 +0200
+Subject: [PATCH 1/9] Mac port: native arm64 build (CMake), libc++ shims,
+ mission-load crash fix
+
+- src/mac/: CMake build for bundled SDL3 + mimalloc, MCCore, MCRedux; source
+  lists taken from the vcxproj files; force-included std headers MSVC pulls in
+  transitively; mutex-backed std::atomic<shared_ptr/weak_ptr> (libc++ lacks
+  P0718); dummy SPIR-V headers so the Vulkan presenter falls back to the
+  software renderer + SDL_Renderer (Metal); MI_OVERRIDE off.
+- MCServices: LocalFileTime via localtime_r on Apple (no chrono::current_zone).
+- MCUpdateDisplay: skip expired screen children (crashed on mission start).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/lib/MCCore/gui/MCUpdateDisplay.cpp    |   7 +-
+ src/lib/MCCore/platform/MCServices.cpp    |   9 +
+ src/mac/.gitignore                        |   4 +
+ src/mac/CMakeLists.txt                    |  44 +++
+ src/mac/generated/MCVersion.h             |   4 +
+ src/mac/generated/shaders/composite.spv.h |   3 +
+ src/mac/generated/shaders/draw.spv.h      |   3 +
+ src/mac/generated/shaders/instance.spv.h  |   3 +
+ src/mac/generated/shaders/quad.spv.h      |   3 +
+ src/mac/generated/shaders/terrain.spv.h   |   3 +
+ src/mac/prelude.h                         |  48 +++
+ src/mac/sources.cmake                     | 403 ++++++++++++++++++++++
+ 12 files changed, 533 insertions(+), 1 deletion(-)
+ create mode 100644 src/mac/.gitignore
+ create mode 100644 src/mac/CMakeLists.txt
+ create mode 100644 src/mac/generated/MCVersion.h
+ create mode 100644 src/mac/generated/shaders/composite.spv.h
+ create mode 100644 src/mac/generated/shaders/draw.spv.h
+ create mode 100644 src/mac/generated/shaders/instance.spv.h
+ create mode 100644 src/mac/generated/shaders/quad.spv.h
+ create mode 100644 src/mac/generated/shaders/terrain.spv.h
+ create mode 100644 src/mac/prelude.h
+ create mode 100644 src/mac/sources.cmake
+
+diff --git a/src/lib/MCCore/gui/MCUpdateDisplay.cpp b/src/lib/MCCore/gui/MCUpdateDisplay.cpp
+index 7f73ee4..8159384 100644
+--- a/src/lib/MCCore/gui/MCUpdateDisplay.cpp
++++ b/src/lib/MCCore/gui/MCUpdateDisplay.cpp
+@@ -286,7 +286,12 @@ int32_t UpdateDisplay(bool screenShot, bool staticNoise, int32_t noiseChance, bo
+ 
+         for (int32_t i = 0; i < ScreenWindow()->NumberOfChildren(); i++)
+         {
+-            ScreenWindow()->Child(i)->Display();
++            // Mac port: ChildList holds weak_ptrs, and a child can expire during scenario load before it is
++            // removed; skip it like MCGuiSystem::Run does.
++            if (const std::shared_ptr<MCGuiObject> child = ScreenWindow()->Child(i); child != nullptr)
++            {
++                child->Display();
++            }
+         }
+     }
+     else
+diff --git a/src/lib/MCCore/platform/MCServices.cpp b/src/lib/MCCore/platform/MCServices.cpp
+index c4f8c83..827ae79 100644
+--- a/src/lib/MCCore/platform/MCServices.cpp
++++ b/src/lib/MCCore/platform/MCServices.cpp
+@@ -43,8 +43,17 @@ uint64_t MCSystemClock::UtcFileTime()
+ 
+ uint64_t MCSystemClock::LocalFileTime()
+ {
++#if defined(__APPLE__)
++    // libc++ has no std::chrono::current_zone(); use the C library's UTC offset for "now".
++    const auto now = std::chrono::system_clock::now();
++    const std::time_t t = std::chrono::system_clock::to_time_t(now);
++    std::tm local{};
++    localtime_r(&t, &local);
++    return ToFileTime(now.time_since_epoch() + std::chrono::seconds(local.tm_gmtoff));
++#else
+     const auto local = std::chrono::current_zone()->to_local(std::chrono::system_clock::now());
+     return ToFileTime(local.time_since_epoch());
++#endif
+ }
+ 
+ int32_t MCCrtRandom::Next()
+diff --git a/src/mac/.gitignore b/src/mac/.gitignore
+new file mode 100644
+index 0000000..4f871c6
+--- /dev/null
++++ b/src/mac/.gitignore
+@@ -0,0 +1,4 @@
++build/
++build-*/
++*.log
++run.pid
+diff --git a/src/mac/CMakeLists.txt b/src/mac/CMakeLists.txt
+new file mode 100644
+index 0000000..c516353
+--- /dev/null
++++ b/src/mac/CMakeLists.txt
+@@ -0,0 +1,44 @@
++# macOS build of MechCommander Redux (personal port; the Windows build stays on MSBuild).
++# Builds bundled SDL3 + mimalloc, MCCore as a static library and MCRedux as the game executable.
++# The Vulkan presenter is compiled but has no SPIR-V on macOS, so MCDisplay falls back to the
++# software renderer + SDL_Renderer (Metal) presenter.
++cmake_minimum_required(VERSION 3.24)
++project(MCReduxMac LANGUAGES C CXX OBJC)
++
++set(MC_SRC ${CMAKE_CURRENT_SOURCE_DIR}/..)
++set(CMAKE_CXX_STANDARD 23)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_OSX_ARCHITECTURES arm64)
++if(NOT CMAKE_BUILD_TYPE)
++  set(CMAKE_BUILD_TYPE Release)
++endif()
++
++set(SDL_SHARED OFF CACHE BOOL "" FORCE)
++set(SDL_STATIC ON CACHE BOOL "" FORCE)
++set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
++add_subdirectory(${MC_SRC}/lib/SDL-release-3.4.12 sdl EXCLUDE_FROM_ALL)
++
++set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
++set(MI_BUILD_OBJECT OFF CACHE BOOL "" FORCE)
++set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
++set(MI_OVERRIDE OFF CACHE BOOL "" FORCE)  # new/delete come from mimalloc-new-delete.h in MCAllocator.cpp
++add_subdirectory(${MC_SRC}/lib/mimalloc-3.3.1 mimalloc EXCLUDE_FROM_ALL)
++
++include(${CMAKE_CURRENT_SOURCE_DIR}/sources.cmake)
++list(LENGTH MCCORE_SOURCES _n)
++message(STATUS "MCCore sources: ${_n} MC_SRC=${MC_SRC}")
++
++add_library(MCCore STATIC ${MCCORE_SOURCES})
++target_include_directories(MCCore PUBLIC
++  ${MC_SRC}/lib/MCCore
++  ${MC_SRC}/lib/mimalloc-3.3.1/include
++  ${CMAKE_CURRENT_SOURCE_DIR}/generated)
++target_precompile_headers(MCCore PRIVATE ${MC_SRC}/lib/MCCore/stdafx.h)
++target_link_libraries(MCCore PUBLIC SDL3::SDL3-static mimalloc-static)
++target_compile_options(MCCore PRIVATE -Wno-everything $<$<COMPILE_LANGUAGE:CXX>:-include ${CMAKE_CURRENT_SOURCE_DIR}/prelude.h>)
++
++add_executable(MCRedux ${MCREDUX_SOURCES})
++target_include_directories(MCRedux PRIVATE ${MC_SRC}/apps/MCRedux)
++target_precompile_headers(MCRedux PRIVATE ${MC_SRC}/apps/MCRedux/stdafx.h)
++target_link_libraries(MCRedux PRIVATE MCCore)
++target_compile_options(MCRedux PRIVATE -Wno-everything $<$<COMPILE_LANGUAGE:CXX>:-include ${CMAKE_CURRENT_SOURCE_DIR}/prelude.h>)
+diff --git a/src/mac/generated/MCVersion.h b/src/mac/generated/MCVersion.h
+new file mode 100644
+index 0000000..2853a96
+--- /dev/null
++++ b/src/mac/generated/MCVersion.h
+@@ -0,0 +1,4 @@
++#pragma once
++#define MC_VERSION "0.2.0.0-mac"
++#define MC_VERSION_SEMVER "0.2.0-mac"
++#define MC_VERSION_COMMIT "3c56e89"
+diff --git a/src/mac/generated/shaders/composite.spv.h b/src/mac/generated/shaders/composite.spv.h
+new file mode 100644
+index 0000000..bdf5819
+--- /dev/null
++++ b/src/mac/generated/shaders/composite.spv.h
+@@ -0,0 +1,3 @@
++#pragma once
++// Mac build: no SPIR-V (Vulkan presenter falls back to software)
++static const unsigned char MC_composite_spirv[] = {0};
+diff --git a/src/mac/generated/shaders/draw.spv.h b/src/mac/generated/shaders/draw.spv.h
+new file mode 100644
+index 0000000..9a8bd1c
+--- /dev/null
++++ b/src/mac/generated/shaders/draw.spv.h
+@@ -0,0 +1,3 @@
++#pragma once
++// Mac build: no SPIR-V (Vulkan presenter falls back to software)
++static const unsigned char MC_draw_spirv[] = {0};
+diff --git a/src/mac/generated/shaders/instance.spv.h b/src/mac/generated/shaders/instance.spv.h
+new file mode 100644
+index 0000000..3b40383
+--- /dev/null
++++ b/src/mac/generated/shaders/instance.spv.h
+@@ -0,0 +1,3 @@
++#pragma once
++// Mac build: no SPIR-V (Vulkan presenter falls back to software)
++static const unsigned char MC_instance_spirv[] = {0};
+diff --git a/src/mac/generated/shaders/quad.spv.h b/src/mac/generated/shaders/quad.spv.h
+new file mode 100644
+index 0000000..445f61a
+--- /dev/null
++++ b/src/mac/generated/shaders/quad.spv.h
+@@ -0,0 +1,3 @@
++#pragma once
++// Mac build: no SPIR-V (Vulkan presenter falls back to software)
++static const unsigned char MC_quad_spirv[] = {0};
+diff --git a/src/mac/generated/shaders/terrain.spv.h b/src/mac/generated/shaders/terrain.spv.h
+new file mode 100644
+index 0000000..75d9ff9
+--- /dev/null
++++ b/src/mac/generated/shaders/terrain.spv.h
+@@ -0,0 +1,3 @@
++#pragma once
++// Mac build: no SPIR-V (Vulkan presenter falls back to software)
++static const unsigned char MC_terrain_spirv[] = {0};
+diff --git a/src/mac/prelude.h b/src/mac/prelude.h
+new file mode 100644
+index 0000000..4bc13ec
+--- /dev/null
++++ b/src/mac/prelude.h
+@@ -0,0 +1,48 @@
++// Mac build: standard headers MSVC's STL pulls in transitively. Force-included before every TU.
++#pragma once
++#ifdef __cplusplus
++#include <list>
++#include <queue>
++#include <stack>
++#include <unordered_set>
++#include <variant>
++#include <sstream>
++#include <random>
++#include <bitset>
++#include <tuple>
++#include <iomanip>
++#include <cwchar>
++#include <cwctype>
++#include <limits>
++#include <type_traits>
++#include <iterator>
++#include <system_error>
++#endif
++
++#ifdef __cplusplus
++// libc++ (Apple clang 21) lacks std::atomic<std::shared_ptr<T>> / <std::weak_ptr<T>> (C++20, P0718).
++// Mutex-backed stand-ins with the operations Redux uses (load/store/exchange, default construction).
++#include <atomic>
++#include <memory>
++#include <mutex>
++#if !defined(__cpp_lib_atomic_shared_ptr)
++namespace std {
++template <class P> struct __mc_atomic_smart {
++    __mc_atomic_smart() noexcept = default;
++    __mc_atomic_smart(P p) noexcept : _p(std::move(p)) {}
++    __mc_atomic_smart(const __mc_atomic_smart&) = delete;
++    __mc_atomic_smart& operator=(const __mc_atomic_smart&) = delete;
++    P load(memory_order = memory_order_seq_cst) const { lock_guard<mutex> g(_m); return _p; }
++    void store(P p, memory_order = memory_order_seq_cst) { lock_guard<mutex> g(_m); _p.swap(p); }
++    P exchange(P p, memory_order = memory_order_seq_cst) { lock_guard<mutex> g(_m); _p.swap(p); return p; }
++    operator P() const { return load(); }
++    void operator=(P p) { store(std::move(p)); }
++private:
++    mutable mutex _m;
++    P _p;
++};
++template <class T> struct atomic<shared_ptr<T>> : __mc_atomic_smart<shared_ptr<T>> { using __mc_atomic_smart<shared_ptr<T>>::__mc_atomic_smart; using __mc_atomic_smart<shared_ptr<T>>::operator=; };
++template <class T> struct atomic<weak_ptr<T>> : __mc_atomic_smart<weak_ptr<T>> { using __mc_atomic_smart<weak_ptr<T>>::__mc_atomic_smart; using __mc_atomic_smart<weak_ptr<T>>::operator=; };
++}
++#endif
++#endif
+diff --git a/src/mac/sources.cmake b/src/mac/sources.cmake
+new file mode 100644
+index 0000000..246eb33
+--- /dev/null
++++ b/src/mac/sources.cmake
+@@ -0,0 +1,403 @@
++set(MCCORE_SOURCES
++  ${MC_SRC}/lib/MCCore/abl/MCAblCallCompiler.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCAblCodeWriter.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCAblCompiler.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCAblDebugger.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCAblDebuggerWindow.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCAblDeclarations.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCAblErrors.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCAblExecExpressions.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCAblExecStatements.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCAblExpressions.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCAblMissionRoutines.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCAblModule.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCAblObjectActionRoutines.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCAblObjectRoutines.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCAblOrderRoutines.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCAblRoutines.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCAblRuntime.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCAblScanner.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCAblStatements.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCAblStdRoutines.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCAblSymbolTable.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCAblUnitRoutines.cpp
++  ${MC_SRC}/lib/MCCore/abl/MCScrollingTextWindow.cpp
++  ${MC_SRC}/lib/MCCore/ai/MCGlobalMap.cpp
++  ${MC_SRC}/lib/MCCore/ai/MCMoveChunk.cpp
++  ${MC_SRC}/lib/MCCore/ai/MCMoveGeometry.cpp
++  ${MC_SRC}/lib/MCCore/ai/MCMoveMap.cpp
++  ${MC_SRC}/lib/MCCore/ai/MCMovePath.cpp
++  ${MC_SRC}/lib/MCCore/ai/MCMovePathManager.cpp
++  ${MC_SRC}/lib/MCCore/ai/MCMoveSystem.cpp
++  ${MC_SRC}/lib/MCCore/ai/MCObjectMap.cpp
++  ${MC_SRC}/lib/MCCore/ai/MCRefit.cpp
++  ${MC_SRC}/lib/MCCore/ai/MCScenarioMap.cpp
++  ${MC_SRC}/lib/MCCore/ai/MCTacticalOrder.cpp
++  ${MC_SRC}/lib/MCCore/appear/MCAppearance.cpp
++  ${MC_SRC}/lib/MCCore/appear/MCAppearanceType.cpp
++  ${MC_SRC}/lib/MCCore/appear/MCAppearanceTypeList.cpp
++  ${MC_SRC}/lib/MCCore/camera/MCCamera.cpp
++  ${MC_SRC}/lib/MCCore/camera/MCCameraList.cpp
++  ${MC_SRC}/lib/MCCore/camera/MCMainWindow.cpp
++  ${MC_SRC}/lib/MCCore/camera/MCViewWindow.cpp
++  ${MC_SRC}/lib/MCCore/color/MCPalette.cpp
++  ${MC_SRC}/lib/MCCore/color/MCWaterCycle.cpp
++  ${MC_SRC}/lib/MCCore/engine/MCBitFlag.cpp
++  ${MC_SRC}/lib/MCCore/engine/MCByteFlag.cpp
++  ${MC_SRC}/lib/MCCore/engine/MCCraterManager.cpp
++  ${MC_SRC}/lib/MCCore/engine/MCDeltaElement.cpp
++  ${MC_SRC}/lib/MCCore/engine/MCElement.cpp
++  ${MC_SRC}/lib/MCCore/engine/MCElementBuffer.cpp
++  ${MC_SRC}/lib/MCCore/engine/MCEllipseElement.cpp
++  ${MC_SRC}/lib/MCCore/engine/MCFont.cpp
++  ${MC_SRC}/lib/MCCore/engine/MCFontElement.cpp
++  ${MC_SRC}/lib/MCCore/engine/MCLineElement.cpp
++  ${MC_SRC}/lib/MCCore/engine/MCPolygonElement.cpp
++  ${MC_SRC}/lib/MCCore/engine/MCScaleDraw.cpp
++  ${MC_SRC}/lib/MCCore/engine/MCVfxElement.cpp
++  ${MC_SRC}/lib/MCCore/engine/MCWriteTga.cpp
++  ${MC_SRC}/lib/MCCore/gameos/MCSoundChannel.cpp
++  ${MC_SRC}/lib/MCCore/gameos/MCSoundRenderer.cpp
++  ${MC_SRC}/lib/MCCore/gameos/MCSoundResource.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCFloatHelp.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiAnimation.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiButton.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiButtonBar.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiCallback.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiChatWindow.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiComboBox.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiFont.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiGlobals.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiHolderObject.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiInput.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiListBox.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiMenu.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiMessageBox.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiObject.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiPort.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiScrollBar.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiScrollTextObject.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiSmackerWindow.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiSpinner.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiStartup.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiStartupWindow.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiSystem.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiSystemDisplay.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiTextObject.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiTimerManager.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiTitleBar.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiTitleWindow.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCGuiTransparentTextObject.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCHardwareCursor.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCScrollPane.cpp
++  ${MC_SRC}/lib/MCCore/gui/MCUpdateDisplay.cpp
++  ${MC_SRC}/lib/MCCore/iface/MCCommandParser.cpp
++  ${MC_SRC}/lib/MCCore/iface/MCFriendlyMechIcon.cpp
++  ${MC_SRC}/lib/MCCore/iface/MCLanceIcon.cpp
++  ${MC_SRC}/lib/MCCore/iface/MCMechBar.cpp
++  ${MC_SRC}/lib/MCCore/iface/MCMechIcon.cpp
++  ${MC_SRC}/lib/MCCore/iface/MCOrderSink.cpp
++  ${MC_SRC}/lib/MCCore/iface/MCTacticalInterface.cpp
++  ${MC_SRC}/lib/MCCore/iface/MCTacticalInterfaceClicks.cpp
++  ${MC_SRC}/lib/MCCore/iface/MCTacticalInterfaceKeys.cpp
++  ${MC_SRC}/lib/MCCore/iface/MCTacticalInterfaceMouseState.cpp
++  ${MC_SRC}/lib/MCCore/iface/MCTacticalInterfaceSelection.cpp
++  ${MC_SRC}/lib/MCCore/lib/MCDice.cpp
++  ${MC_SRC}/lib/MCCore/lib/MCDiskFile.cpp
++  ${MC_SRC}/lib/MCCore/lib/MCFastFile.cpp
++  ${MC_SRC}/lib/MCCore/lib/MCFastFileSet.cpp
++  ${MC_SRC}/lib/MCCore/lib/MCFatal.cpp
++  ${MC_SRC}/lib/MCCore/lib/MCFile.cpp
++  ${MC_SRC}/lib/MCCore/lib/MCFitIniFile.cpp
++  ${MC_SRC}/lib/MCCore/lib/MCLzCompress.cpp
++  ${MC_SRC}/lib/MCCore/lib/MCLzDecompress.cpp
++  ${MC_SRC}/lib/MCCore/lib/MCPacketFile.cpp
++  ${MC_SRC}/lib/MCCore/lib/MCPriorityQueue.cpp
++  ${MC_SRC}/lib/MCCore/linkup/MCFidpGroup.cpp
++  ${MC_SRC}/lib/MCCore/linkup/MCFidpMessage.cpp
++  ${MC_SRC}/lib/MCCore/linkup/MCFidpNetworkProtocol.cpp
++  ${MC_SRC}/lib/MCCore/linkup/MCFidpPlayer.cpp
++  ${MC_SRC}/lib/MCCore/linkup/MCFidpSession.cpp
++  ${MC_SRC}/lib/MCCore/linkup/MCFileTransferInfo.cpp
++  ${MC_SRC}/lib/MCCore/linkup/MCSessionManager.cpp
++  ${MC_SRC}/lib/MCCore/linkup/MCSessionManagerPlayers.cpp
++  ${MC_SRC}/lib/MCCore/linkup/MCSessionManagerReceive.cpp
++  ${MC_SRC}/lib/MCCore/linkup/MCSessionManagerSend.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCBriefingBox.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCBriefingScreen.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCCompInventoryBlock.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCCompPurchaseBlock.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCConnectMenu.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCDragIcon.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCFileScrollPane.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCGameList.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCGenericScreen.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCInventoryBlock.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCLoadSaveMenu.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCLogButton.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCLogChatInput.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCLogChatWindow.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCLogComboBox.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCLogDialogBox.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCLogDialogButton.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCLogGroupBox.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCLogInvScreen.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCLogLabel.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCLogMenus.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCLogObject.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCLogPort.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCLogRows.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCLogScrollTextObject.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCLogSlider.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCLogTextObject.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCLogToolButton.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCMainMenu.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCMechBriefBlock.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCMechInventoryBlock.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCMechPurchaseBlock.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCMechRepairBlock.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCMissionLogisticsBridge.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCPilotInventoryBlock.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCPilotPurchaseBlock.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCPlayerNameObject.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCPreferencesMenu.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCPurchaseDlg.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCPurchaseScreen.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCPurMechList.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCPurPilotList.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCPurProfile.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCPurVehicleList.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCRegistrySettings.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCRepairScreen.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCReusableDialog.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCSessionScreen.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCSmuti.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCSplashScreen.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCStoreRow.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCTicker.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCUnitLimits.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCVehicleInventoryBlock.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCVehiclePurchaseBlock.cpp
++  ${MC_SRC}/lib/MCCore/logistics/MCVehicleRepairBlock.cpp
++  ${MC_SRC}/lib/MCCore/main/MCAblDebuggerConsole.cpp
++  ${MC_SRC}/lib/MCCore/main/MCErrorReport.cpp
++  ${MC_SRC}/lib/MCCore/main/MCForceMessages.cpp
++  ${MC_SRC}/lib/MCCore/main/MCGameContext.cpp
++  ${MC_SRC}/lib/MCCore/main/MCGamePaths.cpp
++  ${MC_SRC}/lib/MCCore/main/MCGameSession.cpp
++  ${MC_SRC}/lib/MCCore/main/MCGameStrings.cpp
++  ${MC_SRC}/lib/MCCore/main/MCInventoryList.cpp
++  ${MC_SRC}/lib/MCCore/main/MCLogistics.cpp
++  ${MC_SRC}/lib/MCCore/main/MCLogisticsCampaign.cpp
++  ${MC_SRC}/lib/MCCore/main/MCLogisticsCheats.cpp
++  ${MC_SRC}/lib/MCCore/main/MCLogisticsForce.cpp
++  ${MC_SRC}/lib/MCCore/main/MCLogisticsMultiplayer.cpp
++  ${MC_SRC}/lib/MCCore/main/MCLogisticsPurchasing.cpp
++  ${MC_SRC}/lib/MCCore/main/MCLogisticsScenario.cpp
++  ${MC_SRC}/lib/MCCore/main/MCLogisticsShared.cpp
++  ${MC_SRC}/lib/MCCore/main/MCLogMech.cpp
++  ${MC_SRC}/lib/MCCore/main/MCLogMechList.cpp
++  ${MC_SRC}/lib/MCCore/main/MCLogVehicle.cpp
++  ${MC_SRC}/lib/MCCore/main/MCLogVehicleList.cpp
++  ${MC_SRC}/lib/MCCore/main/MCLogWarrior.cpp
++  ${MC_SRC}/lib/MCCore/main/MCLogWarriorList.cpp
++  ${MC_SRC}/lib/MCCore/main/MCMissionGlobals.cpp
++  ${MC_SRC}/lib/MCCore/main/MCMPPlayerLights.cpp
++  ${MC_SRC}/lib/MCCore/main/MCSystemConfig.cpp
++  ${MC_SRC}/lib/MCCore/MCPort.cpp
++  ${MC_SRC}/lib/MCCore/mission/MCDifficultySettings.cpp
++  ${MC_SRC}/lib/MCCore/mission/MCMission.cpp
++  ${MC_SRC}/lib/MCCore/mission/MCMissionResults.cpp
++  ${MC_SRC}/lib/MCCore/mission/MCMissionResultsScreen.cpp
++  ${MC_SRC}/lib/MCCore/mission/MCScenario.cpp
++  ${MC_SRC}/lib/MCCore/mission/MCScenarioLoad.cpp
++  ${MC_SRC}/lib/MCCore/mission/MCScenarioObjectives.cpp
++  ${MC_SRC}/lib/MCCore/mission/MCScenarioPart.cpp
++  ${MC_SRC}/lib/MCCore/network/MCMultiPlayer.cpp
++  ${MC_SRC}/lib/MCCore/network/MCMultiPlayerHandlers.cpp
++  ${MC_SRC}/lib/MCCore/network/MCMultiPlayerSend.cpp
++  ${MC_SRC}/lib/MCCore/network/MCWorldStateChunk.cpp
++  ${MC_SRC}/lib/MCCore/object/MCAIControl.cpp
++  ${MC_SRC}/lib/MCCore/object/MCArtillery.cpp
++  ${MC_SRC}/lib/MCCore/object/MCArtilleryChunk.cpp
++  ${MC_SRC}/lib/MCCore/object/MCArtilleryType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCBaseObject.cpp
++  ${MC_SRC}/lib/MCCore/object/MCBattleMech.cpp
++  ${MC_SRC}/lib/MCCore/object/MCBattleMechCombat.cpp
++  ${MC_SRC}/lib/MCCore/object/MCBattleMechMovement.cpp
++  ${MC_SRC}/lib/MCCore/object/MCBattleMechNetwork.cpp
++  ${MC_SRC}/lib/MCCore/object/MCBattleMechType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCBigGameObject.cpp
++  ${MC_SRC}/lib/MCCore/object/MCBuilding.cpp
++  ${MC_SRC}/lib/MCCore/object/MCBuildingMarines.cpp
++  ${MC_SRC}/lib/MCCore/object/MCBuildingType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCBullet.cpp
++  ${MC_SRC}/lib/MCCore/object/MCBulletType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCCameraDrone.cpp
++  ${MC_SRC}/lib/MCCore/object/MCCameraDroneType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCCollisionGrid.cpp
++  ${MC_SRC}/lib/MCCore/object/MCCollisionSystem.cpp
++  ${MC_SRC}/lib/MCCore/object/MCCommander.cpp
++  ${MC_SRC}/lib/MCCore/object/MCContactSystem.cpp
++  ${MC_SRC}/lib/MCCore/object/MCDebris.cpp
++  ${MC_SRC}/lib/MCCore/object/MCDebrisType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCDynamics.cpp
++  ${MC_SRC}/lib/MCCore/object/MCEffectSystem.cpp
++  ${MC_SRC}/lib/MCCore/object/MCElemental.cpp
++  ${MC_SRC}/lib/MCCore/object/MCElementalCombat.cpp
++  ${MC_SRC}/lib/MCCore/object/MCElementalDynamics.cpp
++  ${MC_SRC}/lib/MCCore/object/MCElementalGameSystem.cpp
++  ${MC_SRC}/lib/MCCore/object/MCElementalMovement.cpp
++  ${MC_SRC}/lib/MCCore/object/MCElementalType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCExplosion.cpp
++  ${MC_SRC}/lib/MCCore/object/MCExplosionType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCFire.cpp
++  ${MC_SRC}/lib/MCCore/object/MCFireType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCForces.cpp
++  ${MC_SRC}/lib/MCCore/object/MCGameObject.cpp
++  ${MC_SRC}/lib/MCCore/object/MCGate.cpp
++  ${MC_SRC}/lib/MCCore/object/MCGateType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCGroundVehicle.cpp
++  ${MC_SRC}/lib/MCCore/object/MCGroundVehicleCombat.cpp
++  ${MC_SRC}/lib/MCCore/object/MCGroundVehicleDynamics.cpp
++  ${MC_SRC}/lib/MCCore/object/MCGroundVehicleGameSystem.cpp
++  ${MC_SRC}/lib/MCCore/object/MCGroundVehicleMovement.cpp
++  ${MC_SRC}/lib/MCCore/object/MCGroundVehicleNetwork.cpp
++  ${MC_SRC}/lib/MCCore/object/MCGroundVehicleType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCJet.cpp
++  ${MC_SRC}/lib/MCCore/object/MCJetType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCLaser.cpp
++  ${MC_SRC}/lib/MCCore/object/MCLaserType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCLight.cpp
++  ${MC_SRC}/lib/MCCore/object/MCLightType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCMasterComponent.cpp
++  ${MC_SRC}/lib/MCCore/object/MCMechDynamics.cpp
++  ${MC_SRC}/lib/MCCore/object/MCMechGameSystem.cpp
++  ${MC_SRC}/lib/MCCore/object/MCMechWarrior.cpp
++  ${MC_SRC}/lib/MCCore/object/MCMechWarriorAlarms.cpp
++  ${MC_SRC}/lib/MCCore/object/MCMechWarriorCombat.cpp
++  ${MC_SRC}/lib/MCCore/object/MCMechWarriorMovement.cpp
++  ${MC_SRC}/lib/MCCore/object/MCMechWarriorOrders.cpp
++  ${MC_SRC}/lib/MCCore/object/MCMiscTerrainObject.cpp
++  ${MC_SRC}/lib/MCCore/object/MCMiscTerrainObjectType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCMover.cpp
++  ${MC_SRC}/lib/MCCore/object/MCMoverGameSystem.cpp
++  ${MC_SRC}/lib/MCCore/object/MCMoverGroup.cpp
++  ${MC_SRC}/lib/MCCore/object/MCMoverMovement.cpp
++  ${MC_SRC}/lib/MCCore/object/MCMoverWeapons.cpp
++  ${MC_SRC}/lib/MCCore/object/MCNetControl.cpp
++  ${MC_SRC}/lib/MCCore/object/MCObjectBlockManager.cpp
++  ${MC_SRC}/lib/MCCore/object/MCObjectDrawing.cpp
++  ${MC_SRC}/lib/MCCore/object/MCObjectEvent.cpp
++  ${MC_SRC}/lib/MCCore/object/MCObjectList.cpp
++  ${MC_SRC}/lib/MCCore/object/MCObjectQueue.cpp
++  ${MC_SRC}/lib/MCCore/object/MCObjectSystem.cpp
++  ${MC_SRC}/lib/MCCore/object/MCObjectType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCObjectTypeManager.cpp
++  ${MC_SRC}/lib/MCCore/object/MCPilotOrders.cpp
++  ${MC_SRC}/lib/MCCore/object/MCPlayerControl.cpp
++  ${MC_SRC}/lib/MCCore/object/MCPotentialContact.cpp
++  ${MC_SRC}/lib/MCCore/object/MCProjectileLaser.cpp
++  ${MC_SRC}/lib/MCCore/object/MCProjectileLaserType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCSensorSystem.cpp
++  ${MC_SRC}/lib/MCCore/object/MCSmoke.cpp
++  ${MC_SRC}/lib/MCCore/object/MCSmokeType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCSortList.cpp
++  ${MC_SRC}/lib/MCCore/object/MCStatusChunk.cpp
++  ${MC_SRC}/lib/MCCore/object/MCTacOrderQueue.cpp
++  ${MC_SRC}/lib/MCCore/object/MCTeam.cpp
++  ${MC_SRC}/lib/MCCore/object/MCTerrainObject.cpp
++  ${MC_SRC}/lib/MCCore/object/MCTerrainObjectType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCTrain.cpp
++  ${MC_SRC}/lib/MCCore/object/MCTrainCar.cpp
++  ${MC_SRC}/lib/MCCore/object/MCTrainCarType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCTrainManager.cpp
++  ${MC_SRC}/lib/MCCore/object/MCTree.cpp
++  ${MC_SRC}/lib/MCCore/object/MCTreeBuilding.cpp
++  ${MC_SRC}/lib/MCCore/object/MCTreeBuildingType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCTreeType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCTurret.cpp
++  ${MC_SRC}/lib/MCCore/object/MCTurretType.cpp
++  ${MC_SRC}/lib/MCCore/object/MCVertexPlacement.cpp
++  ${MC_SRC}/lib/MCCore/object/MCWeaponChunkDebug.cpp
++  ${MC_SRC}/lib/MCCore/object/MCWeaponFireChunk.cpp
++  ${MC_SRC}/lib/MCCore/object/MCWeaponHitChunk.cpp
++  ${MC_SRC}/lib/MCCore/object/MCWeaponShotInfo.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCAllocator.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCAudio.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCBlockStore.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCCursor.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCDirectPlay.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCDisplay.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCFileSystem.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCFrameLog.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCInput.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCPresenter.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCRegisteredBlock.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCRegistry.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCRenderer.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCSdlPresenter.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCServices.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCSmacker.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCSocket.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCSoftwareRenderer.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCSoftwareRendererPolygons.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCSoftwareRendererShapes.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCStringTable.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCVulkanPresenter.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCVulkanRenderer.cpp
++  ${MC_SRC}/lib/MCCore/platform/MCVulkanShaders.cpp
++  ${MC_SRC}/lib/MCCore/sound/MCRadio.cpp
++  ${MC_SRC}/lib/MCCore/sound/MCRadioMessage.cpp
++  ${MC_SRC}/lib/MCCore/sound/MCSoundSystem.cpp
++  ${MC_SRC}/lib/MCCore/sprite/MCArmAppearance.cpp
++  ${MC_SRC}/lib/MCCore/sprite/MCArmAppearanceType.cpp
++  ${MC_SRC}/lib/MCCore/sprite/MCElementalActor.cpp
++  ${MC_SRC}/lib/MCCore/sprite/MCElementalTree.cpp
++  ${MC_SRC}/lib/MCCore/sprite/MCGVAppearance.cpp
++  ${MC_SRC}/lib/MCCore/sprite/MCGVAppearanceType.cpp
++  ${MC_SRC}/lib/MCCore/sprite/MCMechActor.cpp
++  ${MC_SRC}/lib/MCCore/sprite/MCPUAppearance.cpp
++  ${MC_SRC}/lib/MCCore/sprite/MCPUAppearanceType.cpp
++  ${MC_SRC}/lib/MCCore/sprite/MCShape.cpp
++  ${MC_SRC}/lib/MCCore/sprite/MCSpriteManager.cpp
++  ${MC_SRC}/lib/MCCore/sprite/MCSpriteMath.cpp
++  ${MC_SRC}/lib/MCCore/sprite/MCSpriteTree.cpp
++  ${MC_SRC}/lib/MCCore/sprite/MCVfxAppearance.cpp
++  ${MC_SRC}/lib/MCCore/sprite/MCVfxAppearanceType.cpp
++  ${MC_SRC}/lib/MCCore/sprite/MCVfxBuildingAppearance.cpp
++  ${MC_SRC}/lib/MCCore/sprite/MCVfxBuildingAppearanceType.cpp
++  ${MC_SRC}/lib/MCCore/stdafx.cpp
++  ${MC_SRC}/lib/MCCore/terrain/MCArtilleryButton.cpp
++  ${MC_SRC}/lib/MCCore/terrain/MCGroundMesh.cpp
++  ${MC_SRC}/lib/MCCore/terrain/MCMapBlockManager.cpp
++  ${MC_SRC}/lib/MCCore/terrain/MCTacticalMap.cpp
++  ${MC_SRC}/lib/MCCore/terrain/MCTacticalMapPages.cpp
++  ${MC_SRC}/lib/MCCore/terrain/MCTerrain.cpp
++  ${MC_SRC}/lib/MCCore/terrain/MCTerrainBlock.cpp
++  ${MC_SRC}/lib/MCCore/terrain/MCTerrainTiles.cpp
++  ${MC_SRC}/lib/MCCore/terrain/MCTerrainWindow.cpp
++  ${MC_SRC}/lib/MCCore/terrain/MCToolPalButton.cpp
++  ${MC_SRC}/lib/MCCore/terrain/MCVideoWindow.cpp
++  ${MC_SRC}/lib/MCCore/vfx/MCAgEllipse.cpp
++  ${MC_SRC}/lib/MCCore/vfx/MCAgShapeDraw.cpp
++  ${MC_SRC}/lib/MCCore/vfx/MCAgShapeTransform.cpp
++  ${MC_SRC}/lib/MCCore/vfx/MCAgStatusBar.cpp
++  ${MC_SRC}/lib/MCCore/vfx/MCAlphaPalette.cpp
++  ${MC_SRC}/lib/MCCore/vfx/MCFastShape.cpp
++  ${MC_SRC}/lib/MCCore/vfx/MCVfxFont.cpp
++  ${MC_SRC}/lib/MCCore/vfx/MCVfxImage.cpp
++  ${MC_SRC}/lib/MCCore/vfx/MCVfxMath.cpp
++  ${MC_SRC}/lib/MCCore/vfx/MCVfxPolygon.cpp
++  ${MC_SRC}/lib/MCCore/vfx/MCVfxPrimitives.cpp
++  ${MC_SRC}/lib/MCCore/vfx/MCVfxShape.cpp
++  ${MC_SRC}/lib/MCCore/vfx/MCVfxShapeScan.cpp
++  ${MC_SRC}/lib/MCCore/vfx/MCVfxShapeTransform.cpp
++  ${MC_SRC}/lib/MCCore/vfx/MCVfxTile.cpp
++)
++set(MCREDUX_SOURCES
++  ${MC_SRC}/apps/MCRedux/Main.cpp
++  ${MC_SRC}/apps/MCRedux/MCConsole.cpp
++  ${MC_SRC}/apps/MCRedux/MCCrashTrace.cpp
++  ${MC_SRC}/apps/MCRedux/stdafx.cpp
++)
